@@ -1,0 +1,278 @@
+
+title: Vulnerability Overview
+id: slb_vuln_overview # Unique dashboard reference for API call
+grid_columns: 12 # 12 (default) or 24 — column count for the layout grid below
+# there is no auto-refresh defined
+# DPM
+# Asset Inventory
+# CVE knowledge base
+# SDR list
+# Quest exemption list
+
+# base_view flattens the finding-lifecycle fact table, the asset/DPM
+# dimensions, and the 'vuln' CVE risk table into one dashboard-wide shape.
+# Every aggregate/total below queries this view instead of the underlying
+# sources directly, which is what lets a single WHERE clause (built from
+# the dropdown/filter widgets further down) apply consistently everywhere —
+# see "base_view" in dashboards/template.yaml and ADR-011 in
+# docs/backend_architecture.md for why. `vuln` is joined once here (deduped
+# to one row per cve_id first, since a CVE can appear against multiple
+# assets in `vuln` — joining it in every aggregate individually, as this
+# file used to do, is exactly the duplicated-logic problem base_view exists
+# to remove) instead of every risk-related aggregate repeating the same
+# CASE/GROUP BY.
+base_view: "CREATE OR REPLACE VIEW slb_vuln_overview_base AS
+SELECT
+    f.finding_id,
+    f.cve_id,
+    f.asset_id,
+    f.snapshot_date,
+    f.status,
+    f.is_overdue,
+    a.environment,
+    a.internet_exposed,
+    d.value_stream,
+    d.org_unit,
+    d.portfolio,
+    v.slb_true_risk,
+    CASE
+        WHEN v.cortex_vulnerability_risk_score >= 90 THEN 'Critical'
+        WHEN v.cortex_vulnerability_risk_score >= 70 THEN 'High'
+        WHEN v.cortex_vulnerability_risk_score >= 40 THEN 'Medium'
+        WHEN v.cortex_vulnerability_risk_score >= 1 THEN 'Low'
+        ELSE 'Unknown/Out of bounds'
+    END AS risk_category
+FROM read_parquet('/app/data/fact_finding_lifecycle/**/*.parquet', hive_partitioning = true) AS f
+LEFT JOIN read_parquet('/app/data/dim_asset/data.parquet') AS a
+    ON f.asset_id = a.asset_id
+LEFT JOIN read_parquet('/app/data/dim_dpm/data.parquet') AS d
+    ON a.dpm_id = d.dpm_id
+LEFT JOIN (
+    SELECT cve_id,
+           MAX(slb_true_risk) AS slb_true_risk,
+           MAX(cortex_vulnerability_risk_score) AS cortex_vulnerability_risk_score
+    FROM 'vuln'
+    GROUP BY cve_id
+) AS v
+    ON f.cve_id = v.cve_id;"
+
+aggregates:
+  # Sankey aggregates: each query returns {source, target, value} rows —
+  # one row per link in the flow — directly, matching the same `data`
+  # contract every other aggregate-backed widget uses. `source` is a fixed
+  # root label since every link in these diagrams fans out from the same
+  # starting point.
+  - name: "sankey_internet_exposure"
+    query: "SELECT 'Total Vulnerabilities' AS source, exposure_status AS target, vuln_count AS value FROM (SELECT CASE WHEN internet_exposed THEN 'Internet Exposed' ELSE 'Not exposed' END AS exposure_status, COUNT(*) AS vuln_count FROM slb_vuln_overview_base GROUP BY 1) t;"
+  - name: "sankey_slb_risk"
+    query: "SELECT 'Total Vulnerabilities' AS source, slb_true_risk AS target, vuln_count AS value FROM (SELECT slb_true_risk, COUNT(*) AS vuln_count FROM slb_vuln_overview_base GROUP BY slb_true_risk) t;"
+  - name: "sankey_vendor_risk"
+    # risk_category is precomputed once in base_view (was a CASE bucketing
+    # cortex_vulnerability_risk_score repeated in this query before).
+    query: "SELECT 'Total Vulnerabilities' AS source, risk_category AS target, vuln_count AS value FROM (SELECT risk_category, COUNT(*) AS vuln_count FROM slb_vuln_overview_base GROUP BY risk_category) t;"
+  - name: "findings_by_value_stream"
+    query: "SELECT
+              COALESCE(value_stream, 'Unknown')        AS value_stream,
+              COUNT(*)                                  AS open_findings,
+              COUNT(*) FILTER (WHERE is_overdue)        AS overdue_findings,
+              ROUND(
+                  100.0 * COUNT(*) FILTER (WHERE is_overdue)
+                        / NULLIF(COUNT(*), 0),
+                  1
+              )                                         AS pct_overdue
+          FROM slb_vuln_overview_base
+          WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_base)
+            AND status = 'Open'
+          GROUP BY COALESCE(value_stream, 'Unknown')
+          ORDER BY open_findings DESC;"
+  - name: "findings_by_org_unit"
+    query: "SELECT
+            COALESCE(org_unit, 'Unknown')              AS org_unit,
+            COUNT(*)                                    AS open_findings,
+            COUNT(*) FILTER (WHERE is_overdue)          AS overdue_findings,
+            ROUND(
+                100.0 * COUNT(*) FILTER (WHERE is_overdue)
+                      / NULLIF(COUNT(*), 0),
+                1
+            )                                           AS pct_overdue
+        FROM slb_vuln_overview_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_base)
+          AND status = 'Open'
+        GROUP BY COALESCE(org_unit, 'Unknown')
+        ORDER BY open_findings DESC;"
+  - name: "findings_by_portfolio"
+    query: "SELECT
+            COALESCE(portfolio, 'Unknown')             AS portfolio,
+            COUNT(*)                                    AS open_findings,
+            COUNT(*) FILTER (WHERE is_overdue)          AS overdue_findings,
+            ROUND(
+                100.0 * COUNT(*) FILTER (WHERE is_overdue)
+                      / NULLIF(COUNT(*), 0),
+                1
+            )                                           AS pct_overdue
+        FROM slb_vuln_overview_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_base)
+          AND status = 'Open'
+        GROUP BY COALESCE(portfolio, 'Unknown')
+        ORDER BY open_findings DESC;"
+
+  - name: "filter_data_env"
+    query: "SELECT DISTINCT environment AS env FROM slb_vuln_overview_base ORDER BY env DESC;"
+  - name: "filter_data_risk"
+    query: "SELECT DISTINCT slb_true_risk AS env FROM slb_vuln_overview_base ORDER BY slb_true_risk ASC;"
+
+totals:
+# Totals are for single value results
+# If the query does not return one value, the total's value will be empty string ""
+  - name: "total_vulns"
+    query: "SELECT COUNT(*) FROM slb_vuln_overview_base;"
+  - name: "vuln_assets"
+    query: "SELECT COUNT(DISTINCT asset_id) FROM slb_vuln_overview_base;"
+  - name: "vuln_assets_internet_exposed"
+    query: "SELECT COUNT(DISTINCT asset_id) FROM slb_vuln_overview_base WHERE internet_exposed;"
+  - name: "vulns_internet_exposed"
+    query: "SELECT COUNT(*) FROM slb_vuln_overview_base WHERE internet_exposed;"
+  - name: "vulns_not_internet_exposed"
+    query: "SELECT COUNT(*) FROM slb_vuln_overview_base WHERE NOT internet_exposed;"
+  - name: "priority_one"
+    query: "SELECT COUNT(*) FROM slb_vuln_overview_base WHERE slb_true_risk = '1';"
+
+layout: 
+  - tile: # Label with big font and value with big font.  
+      id: vuln_assets_tile
+      label: "Assets"
+      value: "vuln_assets" 
+      grid: 
+          x: 0
+          y: 0
+          w: 2
+          h: 2
+          min_w: 2
+          min_h: 2
+  - tile: # Label with big font and value with big font.  
+      id: vuln_exposed_assets_tile
+      label: "Internet Exposed Assets"
+      value: "vuln_assets_internet_exposed" 
+      grid: 
+          x: 2
+          y: 0
+          w: 2
+          h: 2
+          min_w: 1
+          min_h: 1
+  - tile: # Label with big font and value with big font.  
+      id: vuln_all
+      label: "Vulnerabilities"
+      value: "total_vulns" 
+      grid: 
+          x: 4
+          y: 0
+          w: 2
+          h: 2
+          min_w: 1
+          min_h: 1
+  - tile: # Label with big font and value with big font.  
+      id: vuln_priority_one_tile
+      label: "SLB Highest Risk"
+      value: "priority_one"
+      grid: 
+          x: 6
+          y: 0
+          w: 2
+          h: 2
+          min_w: 1
+          min_h: 1
+  - dropdown_single: # Single-select dropdown filter. This dropdown will be affected by filters
+      id: dropdown_env
+      label: "Environment"
+      mapping: "environment"
+      data: filter_data_env
+      unfiltered: true 
+      grid: 
+          x: 0
+          y: 2
+          w: 3
+          h: 1
+          min_w: 1
+          min_h: 1
+  - dropdown_multy: 
+      id: dropdown_slb_risk
+      label: "True Risk"
+      data: filter_data_risk
+      mapping: "slb_true_risk"
+      unfiltered: true
+      grid: 
+          x: 3
+          y: 2
+          w: 3
+          h: 1
+          min_w: 1
+          min_h: 1
+  - sankey:
+      id: internet_exposure_sankey
+      title: "Internet Exposure"
+      data: sankey_internet_exposure
+      grid:
+          x: 0
+          y: 3
+          w: 4
+          h: 5
+          min_w: 1
+          min_h: 1
+  - sankey:
+      id: vendor_risk_sankey
+      title: "Vendor Risk"
+      data: sankey_vendor_risk
+      grid:
+          x: 4
+          y: 3
+          w: 4
+          h: 5
+          min_w: 1
+          min_h: 1
+  - sankey:
+      id: slb_risk_sankey
+      title: "SLB True Risk"
+      data: sankey_slb_risk
+      grid:
+          x: 8
+          y: 3
+          w: 4
+          h: 5
+          min_w: 1
+          min_h: 1
+  - horizontal_bar_chart:
+      id: "slb_vulns_by_org"
+      title: "Findings by Org Unit"
+      data: findings_by_org_unit
+      grid:
+          x: 0
+          y: 8
+          w: 4
+          h: 7
+          min_w: 1
+          min_h: 1
+  - horizontal_bar_chart:
+      id: "slb_vulns_by_value_stream"
+      title: "Findings by Value Stream"
+      data: findings_by_value_stream
+      grid:
+          x: 4
+          y: 8
+          w: 4
+          h: 7
+          min_w: 1
+          min_h: 1
+  - horizontal_bar_chart:
+      id: "slb_vulns_by_portf"
+      title: "Findings by Portfolio"
+      data: findings_by_portfolio
+      grid:
+          x: 8
+          y: 8
+          w: 4
+          h: 7
+          min_w: 1
+          min_h: 1
+
+

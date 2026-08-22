@@ -1,0 +1,106 @@
+
+title: Vulnerabilities - MTTR
+id: slb_vuln_view_mttr
+grid_columns: 12 # 12 (default) or 24 — column count for the layout grid below
+
+# Flat passthrough view over the pre-aggregated daily rollup. See the
+# base_view note in dashboards/template.yaml for why this is required even
+# for a single-source dashboard.
+base_view: "CREATE OR REPLACE VIEW slb_vuln_view_mttr_base AS SELECT * FROM vuln_daily;"
+
+aggregates:
+  - name: "trend_analysis"
+    query: "SELECT snapshot_date,
+            SUM(new_open_count) as new_findings,
+            SUM(total_open_eod) as open_at_end_of_day,
+            SUM(newly_closed_count) as closed_on_day,
+            SUM(total_overdue_count) as overdue_at_end_of_day
+            FROM slb_vuln_view_mttr_base
+            WHERE snapshot_date >= CURRENT_DATE - INTERVAL '90 days'
+            GROUP BY snapshot_date
+            ORDER BY snapshot_date DESC"
+  - name: "trend_by_priority_analysis_resolved"
+    query: "SELECT snapshot_date,
+            slb_true_risk,
+            SUM(new_open_count) as resolved_count
+            FROM slb_vuln_view_mttr_base
+            WHERE snapshot_date >= CURRENT_DATE - INTERVAL '30 days'
+            GROUP BY snapshot_date, slb_true_risk
+            ORDER BY snapshot_date DESC, slb_true_risk ASC"
+  - name: "trend_by_priority_analysis_open"
+    query: "SELECT snapshot_date,
+            slb_true_risk,
+            SUM(total_open_eod) as still_opem
+            FROM slb_vuln_view_mttr_base
+            WHERE snapshot_date >= CURRENT_DATE - INTERVAL '30 days'
+            GROUP BY snapshot_date, slb_true_risk
+            ORDER BY snapshot_date DESC, slb_true_risk ASC"
+  - name: "trend_by_priority_analysis2"
+    query: "SELECT snapshot_date,
+            slb_true_risk,
+            SUM(new_open_count) as resolved_count,
+            SUM(total_open_eod) as still_opem,
+            ROUND(
+                SUM(newly_closed_count)::DOUBLE /
+                NULLIF(SUM(total_open_eod) + SUM(newly_closed_count), 0) * 100, 2 ) as daily_resolution_rate_pct
+            FROM slb_vuln_view_mttr_base
+            WHERE snapshot_date >= CURRENT_DATE - INTERVAL '30 days'
+            GROUP BY snapshot_date, slb_true_risk
+            ORDER BY snapshot_date DESC, slb_true_risk ASC"
+
+totals:
+# Totals are for single value results
+# If the query does not return one value, the total's value will be empty string ""
+  - name: "total_vulns"
+    # Was "SELECT COUNT(*) FROM 'vuln'" — a different, unrelated table this
+    # MTTR dashboard otherwise never touches. Now that every total/aggregate
+    # must query base_view, this reports open findings as of the latest
+    # daily snapshot instead, which is both queryable from this dashboard's
+    # own view and a more meaningful "vulns" figure for a trend dashboard.
+    query: "SELECT SUM(total_open_eod) FROM slb_vuln_view_mttr_base WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_view_mttr_base);"
+
+layout: 
+  - tile: # Label with big font and value with big font.  
+      id: vuln_assets_tile
+      label: "Vulns"
+      value: "total_vulns" 
+      grid: 
+          x: 0
+          y: 0
+          w: 2
+          h: 2
+          min_w: 2
+          min_h: 2
+  - area_chart:
+      id: vuln_resolution_trend
+      title: "Resolution Trend (90 days)"
+      data: trend_analysis
+      grid:
+          x: 0
+          y: 3
+          w: 6
+          h: 4
+          min_w: 3
+          min_h: 3
+  - area_chart:
+      id: vuln_resolution_by_priority_resolved
+      title: "Resolved by Priority"
+      data: trend_by_priority_analysis_resolved
+      grid:
+          x: 6
+          y: 3
+          w: 6
+          h: 4
+          min_w: 3
+          min_h: 3
+  - area_chart:
+      id: vuln_resolution_by_priority_open
+      title: "Open by priority"
+      data: trend_by_priority_analysis_open
+      grid:
+          x: 6
+          y: 7
+          w: 6
+          h: 4
+          min_w: 3
+          min_h: 3

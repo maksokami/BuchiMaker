@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BuchiMaker Dashboard</title>
+    <!-- Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Icons -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <!-- Gridstack CSS -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/gridstack.js/9.2.2/gridstack.min.css" rel="stylesheet" />
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/gridstack.js/9.2.2/gridstack-extra.min.css" rel="stylesheet" />
+    <!-- Custom Styles (includes .gs-24 rules for `grid_columns: 24` dashboards — see styles.css) -->
+    <link href="/styles.css?v=4" rel="stylesheet">
+    <!-- Theme Init -->
+    <script>
+        (function () {
+            var value = "; " + document.cookie;
+            var parts = value.split("; uiTheme=");
+            var theme = parts.length === 2 ? parts.pop().split(";").shift() : "light";
+            document.documentElement.setAttribute("data-theme", theme);
+        })();
+    </script>
+</head>
+
+<body>
+    <div id="app">
+        <div class="app-container" :class="{ 'sidebar-collapsed': isSidebarCollapsed }">
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <div class="sidebar-header">
+                    <div class="logo">
+                        <span class="logo-text">BuchiMaker</span>
+                    </div>
+                    <button class="toggle-btn" @click="toggleSidebar" aria-label="Toggle Sidebar">
+                        <i class="fa-solid fa-bars"></i>
+                    </button>
+                </div>
+
+                <nav class="sidebar-nav">
+                    <ul class="nav-list">
+                        <li class="nav-item" v-for="db in dashboards" :key="db.id"
+                            :class="{ active: currentPage === 'dashboard' && activeDashboardId === db.id }">
+                            <a href="#" class="nav-link" @click.prevent="navigateToDashboard(db.id)">
+                                <i class="fa-solid fa-table-columns nav-icon"></i>
+                                <span class="nav-text">{{ db.name || db.title }}</span>
+                            </a>
+                        </li>
+                    </ul>
+                </nav>
+
+                <div class="sidebar-footer">
+                    <div class="footer-actions">
+                        <button v-if="isAdministrator()" class="footer-action-btn" title="Logs" @click.prevent="currentPage = 'logs'"
+                            :class="{ active: currentPage === 'logs' }">
+                            <i class="fa-solid fa-file-lines"></i>
+                        </button>
+                        <button v-if="isDataAdminOrAbove()" class="footer-action-btn" title="Settings" @click.prevent="currentPage = 'settings'"
+                            :class="{ active: currentPage === 'settings' }">
+                            <i class="fa-solid fa-gear"></i>
+                        </button>
+                        <button class="footer-action-btn" title="Info">
+                            <i class="fa-solid fa-circle-info"></i>
+                        </button>
+                    </div>
+                    <div class="user-profile">
+                        <div class="avatar">
+                            <i class="fa-solid fa-person"></i>
+                        </div>
+                        <div class="user-info">
+                            <span class="user-name">{{ authState.name }}</span>
+                            <span class="user-role">{{ authState.role }}</span>
+                        </div>
+                        <a v-if="!authState.isAnonymous" href="#" class="logout-btn" title="Log Out" aria-label="Log Out"
+                            @click.prevent="logout">
+                            <i class="fa-solid fa-right-from-bracket"></i>
+                        </a>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- Routed Views — gated on authState.loading so nothing fetches
+                 (or flashes) before the initial /auth/me round trip decides
+                 whether this request even belongs on this page (see app.js). -->
+            <template v-if="!authState.loading">
+                <dashboard-view v-if="currentPage === 'dashboard'" :key="activeDashboardId"
+                    :dashboard-id="activeDashboardId" :api-base-url="apiBaseUrl">
+                </dashboard-view>
+
+                <settings-page v-else-if="currentPage === 'settings'" :api-base-url="apiBaseUrl" @dashboards-changed="fetchDashboards">
+                </settings-page>
+
+                <logs-view v-else-if="currentPage === 'logs'" :api-base-url="apiBaseUrl"></logs-view>
+
+                <access-denied v-else-if="currentPage === 'denied'" :email="authState.email"></access-denied>
+            </template>
+
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <!-- Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- Gridstack -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gridstack.js/9.2.2/gridstack-all.js"></script>
+    <!-- ECharts -->
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+
+    <!-- Config -->
+    <script src="/config.js"></script>
+
+    <!-- App Logic -->
+    <script src="/app.js?v=6" type="module"></script>
+</body>
+
+</html>

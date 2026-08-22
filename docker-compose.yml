@@ -1,0 +1,143 @@
+
+services:
+
+  # ── buchi Backend ────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime
+    image: buchi-backend:0.3.0
+    container_name: buchi-backend
+    restart: unless-stopped
+    ports:
+      # Host-side ports only; override via .env (see .env.example) — the
+      # container-internal ports (right-hand side) are fixed by API_PORT/
+      # HEALTH_PORT above and must not change independently of them.
+      - "${API_HOST_PORT:-8000}:8000" # Main API
+      - "${HEALTH_HOST_PORT:-35400}:35400" # Health check (spec: classes.md)
+    volumes:
+      - ./dashboards:/app/dashboards:ro # Read-only dashboard YAMLs
+      # Read-only local data files. This is also the *only* directory CSV/JSON/
+      # Parquet data sources may be registered from — the backend rejects any
+      # `filepath` that doesn't resolve inside DATA_DIR (see ADR-013 in
+      # docs/backend_architecture.md), so put every file a dashboard needs to
+      # read somewhere under ./data (subfolders are fine). Mounting anything
+      # else read-write here, or pointing DATA_DIR elsewhere, only widens what
+      # a data-source registration can read — it doesn't narrow it.
+      - ./data:/app/data:ro
+      - ./frontend/widgets:/app/widgets:ro # Read-only widget-set packages (shared with the frontend build)
+      - ./db:/app/db:rw # Audit log DB persists here across restarts; the main data-engine DB is rebuilt from data sources on every startup regardless
+      # Mounted as a directory, not individual files: if a host file doesn't exist yet,
+      # Docker's bind-mount would create a directory in its place instead of a file,
+      # so the app would see a directory where it expects general.yaml/data_sources.yaml/etc
+      # and fail to read it. Mounting the parent directory avoids that entirely — Docker
+      # only has to create ./settings/ itself (an empty dir) on first run, and the app
+      # already creates/defaults each YAML file inside it as needed (see
+      # app/core/general_settings.py and app/models/system_manager.py).
+      - ./settings:/app/settings:rw
+    environment:
+      - DEBUG=false
+      - API_PORT=8000
+      - HEALTH_PORT=35400
+      - DASHBOARDS_DIR=/app/dashboards
+      - DATA_DIR=/app/data
+      - WIDGETS_DIR=/app/widgets
+      - DUCKDB_MEMORY_LIMIT=4GB
+      - LOG_TIMEZONE=local
+      - REFRESH_FREQUENCY=60
+      - REFRESH_FREQUENCY_FILTER=10
+      - UNALLOCATE_FREQUENCY_FILTER=30
+      - TABLE_TRUNCATE_MB=700
+      # Set in a .env file – never hardcode secrets in this file
+      - ALLOW_ORIGINS=${ALLOW_ORIGINS:-*}
+      # ANONYMOUS_USER only seeds general_settings.anonymous_access the very
+      # first time the app runs (no settings/general.yaml yet) — after that,
+      # the Settings > Access tab's "Allow Anonymous Access" toggle is the
+      # sole runtime source of truth and this env var is ignored. Defaults
+      # to ALLOW so a fresh install works out of the box; flip it off (or
+      # toggle the switch in the UI) once OIDC is configured in Settings > SSO.
+      - ANONYMOUS_USER=${ANONYMOUS_USER:-ALLOW}
+      # Optional: preconfigure the OIDC connection instead of using the SSO
+      # tab — e.g. for a Keycloak realm: https://keycloak.example.com/realms/buchimaker.
+      # Only used as a fallback for fields not already set via the UI/settings/general.yaml.
+      - OIDC_ISSUER_URL=${OIDC_ISSUER_URL:-}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:-}
+      - OIDC_REDIRECT_URI=${OIDC_REDIRECT_URI:-}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # Empty by default (no auth — matches the redis service below, which
+      # only enforces a password when this is set). Set REDIS_PASSWORD in
+      # .env for any deployment beyond a single local machine — see the
+      # redis service's `command` and the README's Security section.
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:35400/healthz')" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - buchi-net
+
+  # ── Isolated Redis Cache ────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: buchi-redis
+    restart: unless-stopped
+    # `--requirepass` with an empty string is Redis's own "no password"
+    # state (equivalent to leaving requirepass unset in redis.conf), so this
+    # stays a zero-config no-auth cache until REDIS_PASSWORD is set in .env —
+    # then both this and the backend's REDIS_PASSWORD above pick it up.
+    # Note: the password ends up in this container's process arguments
+    # (visible via `docker inspect`/`ps` to anyone with host/daemon access).
+    # That's an acceptable baseline for a private-network deployment behind
+    # the isolation described in the README's Security section, but for a
+    # real cloud deployment prefer a managed Redis (Azure Cache for Redis,
+    # GCP Memorystore) with the password sourced from a secret manager
+    # instead of this compose file — see the Azure/GCP zero-trust sections
+    # in README.md.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-}"]
+    # Published for local-development convenience only (e.g. inspecting the
+    # cache with `redis-cli`/RedisInsight from the host). Remove this whole
+    # `ports:` block for any deployment reachable beyond your own machine —
+    # the backend reaches Redis over the internal buchi-net network and
+    # never needs the host-published port; see README's Security section.
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-}", "--no-auth-warning", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - buchi-net
+  # ── Frontend ──────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: buchi-frontend:latest
+    container_name: buchi-frontend
+    restart: unless-stopped
+    environment:
+      # Relative by default so the frontend talks to the backend through
+      # nginx's own /api/ and /auth/ proxy (frontend/nginx.conf) — same
+      # origin, so the SSO session cookie is sent automatically. See
+      # .env.example if you need to point this at a separate backend origin.
+      - API_BASE_URL=${API_BASE_URL:-/api/v1}
+      - AUTH_BASE_URL=${AUTH_BASE_URL:-/auth}
+    ports:
+      # nginx inside the container listens on 80 (see frontend/Dockerfile) —
+      # only the host-side port is meant to be overridden.
+      - "${FRONTEND_HOST_PORT:-3000}:80"
+    networks:
+      - buchi-net
+
+networks:
+  buchi-net:
+    driver: bridge

@@ -1,0 +1,620 @@
+
+title: Vulnerability Details Demo (Grid 24)
+id: slb_vuln_details_v3 # Unique dashboard reference for API call
+grid_columns: 24 
+
+
+base_view: "CREATE OR REPLACE VIEW slb_vuln_overview_v2_base AS
+SELECT
+    f.slb_cvss_score,
+    f.vendor_risk_score,
+    f.slb_true_risk,
+    f.finding_id,
+    f.cve_id,
+    f.asset_id,
+    f.snapshot_date,
+    f.status,
+    f.is_overdue,
+    f.internet_exposed,
+	f.sla_days,
+    f.days_open,
+	f.quest_exemption_id,
+    a.asset_id,
+    a.asset_env,
+    a.asset_name,
+    a.asset_type,
+    a.asset_dpm_id,
+    a.asset_provider,
+    a.asset_category,
+    d.dpm_name,
+    d.dpm_tier,
+    d.dpm_status,
+    d.dpm_value_stream,
+    d.dpm_orgunit,
+    d.dpm_portfolio,
+    c.cve_cvss_score,
+    c.cve_cvss_severity,
+    c.cve_cvss_version,
+    c.cve_description,
+    c.cve_publishedDate,
+    c.cve_modified,
+    (e.exemption_id IS NOT NULL) AS is_exempted,
+    (c.cve_fixDate IS NOT NULL) AS fix_available,
+    CASE
+        WHEN f.vendor_risk_score >= 90 THEN 'Critical'
+        WHEN f.vendor_risk_score >= 70 THEN 'High'
+        WHEN f.vendor_risk_score >= 40 THEN 'Medium'
+        WHEN f.vendor_risk_score >= 1 THEN 'Low'
+        ELSE 'Unknown/Out of bounds'
+    END AS risk_category
+FROM read_parquet('/app/data/fact_finding_lifecycle/**/*.parquet', hive_partitioning = true) AS f
+LEFT JOIN assets AS a
+    ON f.asset_id = a.asset_id
+LEFT JOIN dpm AS d
+    ON a.asset_dpm_id = d.dpm_id
+LEFT JOIN  cve as c
+    ON f.cve_id = c.cve_cve_id
+LEFT JOIN exemptions AS e
+    ON f.asset_id = e.asset_id;"
+
+aggregates:
+  - name: "findings_by_age"
+    # Only 0-90d buckets, matching the four bars in the mockup.
+    query: "WITH bucketed AS (
+                SELECT
+                    CASE
+                        WHEN days_open <  7 THEN '0-7d'
+                        WHEN days_open < 30 THEN '7-30d'
+                        WHEN days_open < 60 THEN '30-60d'
+                        ELSE                     '60-90d'
+                    END                            AS age_bucket,
+                    CASE
+                        WHEN days_open <  7 THEN 1
+                        WHEN days_open < 30 THEN 2
+                        WHEN days_open < 60 THEN 3
+                        ELSE                     4
+                    END                            AS bucket_order,
+                    finding_id
+                FROM slb_vuln_overview_v2_base
+                WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+                  AND status = 'Open'
+                  AND days_open < 90
+            )
+            SELECT
+                age_bucket,
+                COUNT(*) AS open_findings
+            FROM bucketed
+            GROUP BY age_bucket, bucket_order
+            ORDER BY bucket_order;"
+  - name: "findings_by_slb_risk"
+    query: "SELECT
+            slb_true_risk,
+            COUNT(*)                              AS open_findings,
+            COUNT(*) FILTER (WHERE is_overdue)    AS overdue_findings
+        FROM slb_vuln_overview_v2_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+        AND status = 'Open'
+        GROUP BY slb_true_risk
+        ORDER BY slb_true_risk;"
+  - name: "yearly_status_trend"
+    # New/Closed/Open by year: "New" = findings first seen that year,
+    # "Closed" = findings closed that year, "Open" = still-open findings
+    # as of the last snapshot within that year.
+    query: "WITH per_finding AS (
+                SELECT
+                    finding_id,
+                    MIN(snapshot_date) OVER (PARTITION BY finding_id)  AS first_seen,
+                    snapshot_date,
+                    status
+                FROM slb_vuln_overview_v2_base
+            ),
+            last_snap_per_year AS (
+                SELECT DATE_TRUNC('year', snapshot_date) AS year_start,
+                       MAX(snapshot_date)                AS last_snap
+                FROM slb_vuln_overview_v2_base
+                GROUP BY 1
+            )
+            SELECT
+                l.year_start,
+                COUNT(*) FILTER (
+                    WHERE DATE_TRUNC('year', pf.first_seen) = l.year_start
+                      AND pf.snapshot_date = pf.first_seen
+                )                                                                 AS new,
+                COUNT(*) FILTER (
+                    WHERE pf.status = 'Closed'
+                      AND DATE_TRUNC('year', pf.snapshot_date) = l.year_start
+                )                                                                 AS closed,
+                COUNT(*) FILTER (
+                    WHERE pf.status = 'Open'
+                      AND pf.snapshot_date = l.last_snap
+                )                                                                 AS open
+            FROM per_finding pf
+            JOIN last_snap_per_year l
+              ON DATE_TRUNC('year', pf.snapshot_date) = l.year_start
+            GROUP BY l.year_start
+            ORDER BY l.year_start;"
+  - name: "vulnerability_findings_table"
+    query: "SELECT
+            finding_id,
+            cve_id,
+            asset_name,
+            dpm_name,
+            risk_category,
+            slb_true_risk,
+            status,
+            is_overdue,
+            snapshot_date
+        FROM slb_vuln_overview_v2_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+          AND status = 'Open'
+        ORDER BY slb_true_risk ASC;"
+  - name: "filter_data_dpm"
+    query: "SELECT DISTINCT asset_dpm_id AS dpm_id FROM slb_vuln_overview_v2_base WHERE asset_dpm_id IS NOT NULL ORDER BY asset_dpm_id;"
+  - name: "filter_data_portfolio"
+    query: "SELECT DISTINCT dpm_portfolio AS portfolio FROM slb_vuln_overview_v2_base WHERE dpm_portfolio IS NOT NULL ORDER BY dpm_portfolio;"
+  - name: "filter_data_org_unit"
+    query: "SELECT DISTINCT dpm_orgunit AS org_unit FROM slb_vuln_overview_v2_base WHERE dpm_orgunit IS NOT NULL ORDER BY dpm_orgunit;"
+  - name: "filter_data_value_stream"
+    query: "SELECT DISTINCT dpm_value_stream AS value_stream FROM slb_vuln_overview_v2_base WHERE dpm_value_stream IS NOT NULL ORDER BY dpm_value_stream;"
+  - name: "filter_data_asset_category"
+    query: "SELECT DISTINCT asset_category AS asset_category FROM slb_vuln_overview_v2_base WHERE asset_category IS NOT NULL ORDER BY asset_category;"
+
+totals:
+# Totals are for single value results
+# If the query does not return one value, the total's value will be empty string ""
+  - name: "total_vulns"
+    query: "SELECT COUNT(*) FROM slb_vuln_overview_v2_base WHERE status = 'Open';"
+  - name: "vuln_assets"
+    query: "SELECT COUNT(DISTINCT asset_id) FROM slb_vuln_overview_v2_base WHERE status = 'Open' ;"
+  - name: "quest_exemptions"
+    query: "SELECT COUNT(DISTINCT quest_exemption_id) AS active_exemption_count
+        FROM slb_vuln_overview_v2_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+        AND status = 'Open'
+        AND quest_exemption_id IS NOT NULL;"
+  - name: "val_mttr"
+    query: "SELECT
+            ROUND( SUM(days_open)::DOUBLE / NULLIF(COUNT(*), 0), 1 )                     AS mttr_days
+        FROM slb_vuln_overview_v2_base
+        WHERE status = 'Closed'
+        AND snapshot_date >= (SELECT MAX(snapshot_date) - INTERVAL '30 days' FROM slb_vuln_overview_v2_base)"
+
+mappings:
+  - "dpm_id": "asset_dpm_id"
+  - "portfolio": "dpm_portfolio"
+  - "org_unit": "dpm_orgunit"
+  - "value_stream": "dpm_value_stream"
+  - "digital_whatever": "asset_category"
+  - "environment": "asset_env"
+  - "internet_exposed": "internet_exposed"
+  - "fix_available": "fix_available"
+  - "exempted": "is_exempted"
+  - "overdue": "is_overdue"
+  - "status": "status"
+  - "search_asset": "asset_name"
+
+layout:
+  # ---- Org Filters sidebar (left column) ----
+  - dropdown_single:
+      id: dropdown_dpm_id
+      label: "DPM ID"
+      data: filter_data_dpm
+      mapping: "dpm_id"
+      unfiltered: false
+      grid:
+          x: 0
+          y: 0
+          w: 5
+          h: 1
+          min_w: 2
+          min_h: 1
+  - dropdown_single:
+      id: dropdown_portfolio
+      label: "Portfolio"
+      data: filter_data_portfolio
+      mapping: "portfolio"
+      unfiltered: false
+      grid:
+          x: 0
+          y: 1
+          w: 5
+          h: 1
+          min_w: 2
+          min_h: 1
+  - dropdown_single:
+      id: dropdown_org_unit
+      label: "Org Unit"
+      data: filter_data_org_unit
+      mapping: "org_unit"
+      unfiltered: false
+      grid:
+          x: 0
+          y: 2
+          w: 5
+          h: 1
+          min_w: 2
+          min_h: 1
+  - dropdown_single:
+      id: dropdown_value_stream
+      label: "Value Stream"
+      data: filter_data_value_stream
+      mapping: "value_stream"
+      unfiltered: false
+      grid:
+          x: 0
+          y: 3
+          w: 5
+          h: 1
+          min_w: 2
+          min_h: 1
+  - dropdown_single:
+      id: dropdown_digital_whatever
+      label: "Digital Whatever"
+      data: filter_data_asset_category
+      mapping: "digital_whatever"
+      unfiltered: true
+      grid:
+          x: 0
+          y: 4
+          w: 5
+          h: 1
+          min_w: 2
+          min_h: 1
+
+  # ---- Top KPI tiles ----
+  - tile:
+      id: tile_vuln_findings
+      label: "Vulnerability Findings"
+      value: "total_vulns"
+      grid:
+          x: 5
+          y: 0
+          w: 3
+          h: 2
+          min_w: 1
+          min_h: 1
+  - tile:
+      id: tile_vuln_assets
+      label: "Vulnerable Assets"
+      value: "vuln_assets"
+      grid:
+          x: 8
+          y: 0
+          w: 3
+          h: 2
+          min_w: 1
+          min_h: 1
+  - tile:
+      id: tile_quest_exemptions
+      label: "Active Quest Exemptions"
+      value: "quest_exemptions"
+      grid:
+          x: 11
+          y: 0
+          w: 3
+          h: 2
+          min_w: 1
+          min_h: 1
+  - tile:
+      id: tile_sdrs_applied
+      label: "Active SDRs applied"
+      # No SDR-decision FK is populated on the fact table yet (see base_view
+      # comment above) so there is no real query to back this — placeholder
+      # literal, same approach the previous version of this file used.
+      value: "0"
+      grid:
+          x: 14
+          y: 0
+          w: 3
+          h: 2
+          min_w: 1
+          min_h: 1
+  - tile:
+      id: tile_mttr
+      label: "MTTR"
+      value: "val_mttr"
+      grid:
+          x: 17
+          y: 0
+          w: 3
+          h: 2
+          min_w: 1
+          min_h: 1
+
+  # ---- Button filter row 1 (under each chart) ----
+  - button_filter:
+      id: btn_exposure_all
+      label: "ALL"
+      mapping: "status"
+      toggle_group: "exposure"
+      default_active: true
+      filter:
+          - operator: "neq"
+          - value: "__never_matches__"
+      grid:
+          x: 5
+          y: 2
+          w: 1
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_exposure_exposed
+      label: "Internet Exposed"
+      mapping: "internet_exposed"
+      toggle_group: "exposure"
+      filter:
+          - operator: "eq"
+          - value: "true"
+      grid:
+          x: 6
+          y: 2
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_exposure_not_exposed
+      label: "Not Exposed"
+      mapping: "internet_exposed"
+      toggle_group: "exposure"
+      filter:
+          - o8erator: "eq"
+          - value: "false"
+      grid:
+          x: 8
+          y: 2
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_fix_all
+      label: "ALL"
+      mapping: "status"
+      toggle_group: "fix"
+      default_active: true
+      filter:
+          - operator: "neq"
+          - value: "__never_matches__"
+      grid:
+          x: 11
+          y: 2
+          w: 1
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_fix_available
+      label: "Fix Available"
+      mapping: "fix_available"
+      toggle_group: "fix"
+      filter:
+          - operator: "eq"
+          - value: "true"
+      grid:
+          x: 12
+          y: 2
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_fix_none
+      label: "No Fix"
+      mapping: "fix_available"
+      toggle_group: "fix"
+      filter:
+          - operator: "eq"
+          - value: "false"
+      grid:
+          x: 14
+          y: 2
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_overdue_all
+      label: "ALL"
+      mapping: "status"
+      toggle_group: "overdue"
+      default_active: true
+      filter:
+          - operator: "neq"
+          - value: "__never_matches__"
+      grid:
+          x: 17
+          y: 2
+          w: 1
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_on_time
+      label: "On Time"
+      mapping: "overdue"
+      toggle_group: "overdue"
+      filter:
+          - operator: "eq"
+          - value: "false"
+      grid:
+          x: 18
+          y: 2
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_overdue
+      label: "Overdue"
+      mapping: "overdue"
+      toggle_group: "overdue"
+      filter:
+          - operator: "eq"
+          - value: "true"
+      grid:
+          x: 20
+          y: 2
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+
+  # ---- Button filter row 2 ----
+  - button_filter:
+      id: btn_env_all
+      label: "ALL"
+      mapping: "status"
+      toggle_group: "env"
+      default_active: true
+      filter:
+          - operator: "neq"
+          - value: "__never_matches__"
+      grid:
+          x: 5
+          y: 3
+          w: 1
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_env_production
+      label: "Production"
+      mapping: "environment"
+      toggle_group: "env"
+      filter:
+          - operator: "eq"
+          - value: "production"
+      grid:
+          x: 6
+          y: 3
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_env_non_production
+      label: "Non-Production"
+      mapping: "environment"
+      toggle_group: "env"
+      filter:
+          - operator: "eq"
+          - value: "non-production"
+      grid:
+          x: 8
+          y: 3
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_exempt_all
+      label: "ALL"
+      mapping: "status"
+      toggle_group: "exempted"
+      default_active: true
+      filter:
+          - operator: "neq"
+          - value: "__never_matches__"
+      grid:
+          x: 11
+          y: 3
+          w: 1
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_exempted
+      label: "Exempted"
+      mapping: "exempted"
+      toggle_group: "exempted"
+      filter:
+          - operator: "eq"
+          - value: "true"
+      grid:
+          x: 12
+          y: 3
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_filter:
+      id: btn_not_exempted
+      label: "Not Exempted"
+      mapping: "exempted"
+      toggle_group: "exempted"
+      filter:
+          - operator: "eq"
+          - value: "false"
+      grid:
+          x: 14
+          y: 3
+          w: 1
+          h: 1
+          min_w: 1
+          min_h: 1
+
+  # ---- Search box (nearest available widget: substring filter on asset name) ----
+  - input_filter:
+      id: input_search
+      label: "Search (asset name)"
+      mapping: "search_asset"
+      filter:
+          - operator: "has"
+          - value: ""
+      grid:
+          x: 18
+          y: 4
+          w: 6
+          h: 1
+          min_w: 2
+          min_h: 1
+
+  # ---- Findings table ----
+  - basic_table:
+      id: tbl_vulnerability_findings
+      title: "Vulnerability Findings"
+      data: vulnerability_findings_table
+      grid:
+          x: 0
+          y: 5
+          w: 24
+          h: 8
+          min_w: 4
+          min_h: 3
+
+  # ---- Charts row ----
+  - horizontal_bar_chart:
+      id: chart_age_distribution
+      title: "Findings Age Distribution"
+      data: findings_by_age
+      grid:
+          x: 0
+          y: 13
+          w: 6
+          h: 5
+          min_w: 2
+          min_h: 2
+  - bar_chart:
+      id: chart_all_vulnerabilities
+      title: "All vulnerabilities"
+      data: findings_by_slb_risk
+      grid:
+          x: 6
+          y: 13
+          w: 6
+          h: 5
+          min_w: 2
+          min_h: 2
+  - area_chart:
+      id: chart_yearly_trend
+      title: "Findings by Status (Yearly)"
+      data: yearly_status_trend
+      grid:
+          x: 12
+          y: 13
+          w: 12
+          h: 5
+          min_w: 2
+          min_h: 2

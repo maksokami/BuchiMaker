@@ -1,0 +1,19 @@
+title: Invalid Data Dashboard
+id: test_invalid_data
+
+aggregates:
+  - name: "invalid_sankey_data"
+    query: "SELECT 'hello' as col1, 123 as col2;"
+
+layout: 
+  - sankey:
+      id: test_sankey
+      title: "Test Sankey"
+      data: invalid_sankey_data
+      grid:
+          x: 0
+          y: 0
+          w: 4
+          h: 5
+          min_w: 1
+          min_h: 1

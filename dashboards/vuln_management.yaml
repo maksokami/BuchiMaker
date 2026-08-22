@@ -1,0 +1,112 @@
+
+title: Vulnerability Management
+id: slb_vuln_management # Unique dashboard reference for API call
+grid_columns: 12 # 12 (default) or 24 — column count for the layout grid below
+description: "something"
+
+# Flat passthrough view: 'vuln' is already a single denormalized table, so
+# base_view just names it so filters have one consistent target. See the
+# base_view note in dashboards/template.yaml / dashboards/vuln_metrics.yaml
+# for why every dashboard requires this even when there's only one source.
+base_view: "CREATE OR REPLACE VIEW slb_vuln_management_base AS SELECT * FROM vuln;"
+
+aggregates:
+  - name: "dpm_filter_list"
+    query: "SELECT DISTINCT dpm->>'$.id' as DPM, COUNT(*) as count FROM slb_vuln_management_base GROUP BY dpm->>'$.id' ORDER BY count DESC LIMIT 10;"
+
+totals:
+# Totals are for single value results
+# If the query does not return one value, the total's value will be empty string ""
+  - name: "total_vulns"
+    query: "SELECT COUNT(*) FROM slb_vuln_management_base;"
+  - name: "vuln_assets"
+    query: "SELECT COUNT(DISTINCT asset->>'$.id') FROM slb_vuln_management_base"
+  - name: "vuln_assets_internet_exposed"
+    query: "SELECT COUNT(DISTINCT asset->>'$.id')  FROM slb_vuln_management_base WHERE asset->>'$.internet_exposed' = 'true'"
+  - name: "priority_one"
+    query: "SELECT COUNT(*) FROM slb_vuln_management_base WHERE slb_true_risk = '1';"
+
+# 
+mappings:
+  - "filter_dpm": "dpm->>'$.id'"
+
+
+layout: 
+    - tile: # Label with big font and value with big font.  
+        id: vuln_assets_tile
+        label: "Assets"
+        value: "vuln_assets" 
+        grid: 
+            x: 0
+            y: 0
+            w: 2
+            h: 2
+            min_w: 1
+            min_h: 1
+    - tile: # Label with big font and value with big font.  
+        id: vuln_exposed_assets_tile
+        label: "Internet Exposed Assets"
+        value: "vuln_assets_internet_exposed" 
+        grid: 
+            x: 2
+            y: 0
+            w: 2
+            h: 2
+            min_w: 1
+            min_h: 1
+    - tile: # Label with big font and value with big font.  
+        id: vuln_all
+        label: "Vulnerabilities"
+        value: "total_vulns" 
+        grid: 
+            x: 4
+            y: 0
+            w: 2
+            h: 2
+            min_w: 1
+            min_h: 1
+    - tile: # Label with big font and value with big font.  
+        id: vuln_priority_one_tile
+        label: "SLB Highest Risk"
+        value: "priority_one"
+        grid: 
+            x: 6
+            y: 0
+            w: 2
+            h: 2
+            min_w: 1
+            min_h: 1
+    - dropdown_single: # Single-select dropdown filter. This dropdown will be affected by filters
+        id: dpm_list
+        label: "Application DPM ID"
+        mapping: filter_dpm 
+        grid: 
+            x: 1
+            y: 3
+            w: 3
+            h: 0.5
+            min_w: 1
+            min_h: 1
+    - basic_table: 
+        id: all_vulnerabilities
+        title: "Vulnerabilities"
+        data: vuln
+        grid: 
+            x: 0
+            y: 5
+            w: 12
+            h: 8
+            min_w: 1
+            min_h: 1
+        on-row-click-panel:
+            title: "CVE Details"
+            fields: 
+                # Only these fields will show in the panel, in this order
+                # JSON sub-fields are not supported
+                - "cve"
+                - "cvss"
+                - "fix_available"
+                - "exploitable"
+                - "asset"
+                - "slb_true_risk"
+                - "cortex_vulnerability_risk_score"

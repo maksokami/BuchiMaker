@@ -1,0 +1,131 @@
+
+title: Vulnerability saaa
+id: test_dash2 # Unique dashboard reference for API call
+grid_columns: 12 # 12 (default) or 24 — column count for the layout grid below
+# there is no auto-refresh defined
+
+# Flat passthrough view (this dashboard is a scratch/dev copy of
+# vuln_metrics.yaml's older single-table shape). Note: fixed 'vulns' (typo,
+# plural) -> 'vuln' (the actual registered source; see
+# settings/data_sources.yaml).
+base_view: "CREATE OR REPLACE VIEW test_dash2_base AS SELECT * FROM vuln;"
+
+aggregates:
+  # Sankey aggregates: each query returns {source, target, value} rows —
+  # one row per link in the flow — directly, matching the same `data`
+  # contract every other aggregate-backed widget uses. `source` is a fixed
+  # root label since every link in these diagrams fans out from the same
+  # starting point.
+  - name: "sankey_internet_exposure"
+    query: "SELECT 'Total Vulnerabilities' AS source, exposure_status AS target, vuln_count AS value FROM (SELECT CASE WHEN asset->>'$.internet_exposed' = 'true' THEN 'Internet Exposed' ELSE 'Not exposed' END AS exposure_status, COUNT(*) AS vuln_count FROM test_dash2_base GROUP BY 1) t;"
+  - name: "sankey_slb_risk"
+    query: "SELECT 'Total Vulnerabilities' AS source, slb_true_risk AS target, vuln_count AS value FROM (SELECT slb_true_risk, COUNT(*) AS vuln_count FROM test_dash2_base GROUP BY slb_true_risk) t;"
+  - name: "sankey_vendor_risk"
+    query: "SELECT 'Total Vulnerabilities' AS source, risk_category AS target, vuln_count AS value FROM (
+            SELECT
+                CASE
+                    WHEN cortex_vulnerability_risk_score >= 90 THEN 'Critical'
+                    WHEN cortex_vulnerability_risk_score >= 70 THEN 'High'
+                    WHEN cortex_vulnerability_risk_score >= 40 THEN 'Medium'
+                    WHEN cortex_vulnerability_risk_score >= 1 THEN 'Low'
+                    ELSE 'Unknown/Out of bounds'
+                END AS risk_category,
+                COUNT(*) AS vuln_count
+            FROM test_dash2_base
+            GROUP BY 1
+        ) t;"
+
+totals:
+# Totals are for single value results
+# If the query does not return one value, the total's value will be empty string ""
+  - name: "total_vulns"
+    query: "SELECT COUNT(*) FROM test_dash2_base;"
+  - name: "vuln_assets"
+    query: "SELECT COUNT(DISTINCT asset->>'$.id') FROM test_dash2_base"
+  - name: "vuln_assets_internet_exposed"
+    query: "SELECT COUNT(DISTINCT asset->>'$.id')  FROM test_dash2_base WHERE asset->>'$.internet_exposed' = 'true'"
+  - name: "vulns_internet_exposed"
+    query: "SELECT COUNT(*) FROM test_dash2_base WHERE asset->>'$.internet_exposed' = 'true';"
+  - name: "vulns_not_internet_exposed"
+    query: "SELECT COUNT(*) FROM test_dash2_base WHERE asset->>'$.internet_exposed' != 'true';"
+  - name: "priority_one"
+    query: "SELECT COUNT(*) FROM test_dash2_base WHERE slb_true_risk = '1';"
+
+layout: 
+  - tile: # Label with big font and value with big font.  
+      id: vuln_assets_tile
+      label: "Assets"
+      value: "vuln_assets" 
+      grid: 
+          x: 0
+          y: 0
+          w: 3
+          h: 3
+          min_w: 1
+          min_h: 1
+  - tile: # Label with big font and value with big font.  
+      id: vuln_exposed_assets_tile
+      label: "Internet Exposed Assets"
+      value: "vuln_assets_internet_exposed" 
+      grid: 
+          x: 3
+          y: 0
+          w: 3
+          h: 3
+          min_w: 1
+          min_h: 1
+  - tile: # Label with big font and value with big font.  
+      id: vuln97_all
+      label: "Vulnerabilities"
+      value: "total_vulns" 
+      grid: 
+          x: 6
+          y: 0
+          w: 3
+          h: 3
+          min_w: 1
+          min_h: 1
+  - tile: # Label with big font and value with big font.  
+      id: vuln_priority_one_tile
+      label: "SLB Highest Risk"
+      value: "priority_one"
+      grid: 
+          x: 9
+          y: 0
+          w: 3
+          h: 3
+          min_w: 1
+          min_h: 1
+  - sankey:
+      id: internet_exposure_sankey
+      title: "Internet Exposure"
+      data: sankey_internet_exposure
+      grid:
+          x: 0
+          y: 4
+          w: 12
+          h: 5
+          min_w: 1
+          min_h: 1
+  - sankey:
+      id: vendor_risk_sankey
+      title: "Vendor Risk"
+      data: sankey_vendor_risk
+      grid:
+          x: 0
+          y: 9
+          w: 12
+          h: 5
+          min_w: 1
+          min_h: 1
+  - sankey:
+      id: slb_risk_sankey
+      title: "SLB True Risk"
+      data: sankey_slb_risk
+      grid:
+          x: 0
+          y: 14
+          w: 12
+          h: 5
+          min_w: 1
+          min_h: 1

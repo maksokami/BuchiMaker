@@ -1,0 +1,107 @@
+# Minimal onboarding demo dashboard — runs against the bundled
+# templates/data/orders_demo.csv sample dataset (copied to ./data/orders_demo.csv
+# and registered by scripts/init-onboarding.sh). Safe to delete once you've
+# registered your own data sources and built real dashboards.
+#
+# For a full reference of every supported widget type and validation rule,
+# see dashboards/template.yaml — that file is a reference/schema showcase,
+# not something you can load as-is (its base_view joins against data sources
+# this project doesn't ship).
+
+grid_columns: 12
+
+title: Demo Dashboard
+id: demo_dashboard
+description: "Sample dashboard built on the bundled orders_demo.csv dataset"
+
+base_view: "CREATE OR REPLACE VIEW demo_dashboard_base AS
+SELECT * FROM orders_demo;"
+
+totals:
+  - name: total_orders
+    query: "SELECT COUNT(*) AS count FROM demo_dashboard_base"
+    unfiltered: true
+  - name: total_revenue
+    query: "SELECT SUM(amount) AS count FROM demo_dashboard_base"
+
+aggregates:
+  - name: orders_by_status
+    query: "SELECT status, COUNT(*) AS count FROM demo_dashboard_base GROUP BY status"
+  - name: revenue_by_region
+    query: "SELECT region, SUM(amount) AS revenue FROM demo_dashboard_base GROUP BY region"
+  - name: region_list
+    query: "SELECT DISTINCT region FROM demo_dashboard_base ORDER BY region"
+    unfiltered: true
+
+mappings:
+  - "region_col": "region"
+  - "status_col": "status"
+
+layout:
+  - tile:
+      id: tile_total_orders
+      label: "Total Orders"
+      value: "total_orders"
+      grid:
+        x: 0
+        y: 0
+        w: 2
+        h: 1
+        min_w: 2
+        min_h: 1
+  - tile:
+      id: tile_total_revenue
+      label: "Total Revenue"
+      value: "total_revenue"
+      grid:
+        x: 2
+        y: 0
+        w: 2
+        h: 1
+        min_w: 2
+        min_h: 1
+  - dropdown_single:
+      id: dropdown_region
+      label: "Region"
+      data: "region_list"
+      mapping: "region_col"
+      grid:
+        x: 4
+        y: 0
+        w: 2
+        h: 1
+        min_w: 2
+        min_h: 1
+  - pie_chart:
+      id: pie_orders_by_status
+      title: "Orders by Status"
+      data: "orders_by_status"
+      grid:
+        x: 0
+        y: 1
+        w: 4
+        h: 3
+        min_w: 3
+        min_h: 2
+  - bar_chart:
+      id: bar_revenue_by_region
+      title: "Revenue by Region"
+      data: "revenue_by_region"
+      grid:
+        x: 4
+        y: 1
+        w: 4
+        h: 3
+        min_w: 3
+        min_h: 2
+  - basic_table:
+      id: table_orders
+      title: "Orders"
+      data: "orders_demo"
+      grid:
+        x: 0
+        y: 4
+        w: 8
+        h: 3
+        min_w: 4
+        min_h: 2

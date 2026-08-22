@@ -1,0 +1,531 @@
+
+# Visual notes: The dashboard will use a standard 12-column grid for layout
+# by default. You need to define the widget positions and sizes based on
+# this grid: x = 0 starts at far left; y = 0 starts at the top.
+# x = 0 .. 11 and y 0..22 (24-column dashboards: x = 0 .. 23, see
+# `grid_columns` below).
+#mYou create a flat "semantic layer," and filters apply to that layer
+
+# grid_columns (optional, top-level): 12 (default) or 24 — how many columns
+# wide the layout grid below is. Every widget's `grid.x + grid.w` must fit
+# within it, or the dashboard is rejected at load time. Omit it entirely to
+# keep the 12-column default — existing dashboards written before this field
+# existed don't need any change. Pick 24 only when a dashboard genuinely
+# needs finer-grained widths than 12 columns allow (e.g. many narrow filter
+# buttons in a row); it does NOT make anything bigger on screen — a widget
+# with the same `w` just covers half the horizontal space it would on a
+# 12-column dashboard, so switching an existing layout to 24 means doubling
+# every widget's x/w to keep the same proportions.
+grid_columns: 12
+
+title: Template Dashboard With All Widgets
+id: template_dashboard_1 # Unique dashboard reference for API call
+description: ""
+
+# Explanation of Aggregates, totals, and the data source
+# Main idea: user will bring one ready data source per dashboard (one main table). 
+#    All transformations, enrichments must be done by the user before brining the data to BuchiMaker.
+#    BuchiMaker is not a complete replacement of PowerBi.
+# Users are allowed to define queries that return one cell (totals, for widgets that show one value) or aggregates (sort of virtual tables that widgets can show)
+
+# How filters work:
+# DATA SOURCE -> FILTERS -> CACHED DATA SOURCE VIEW (can be shared across multiple users, if they happen to use the same filters, to save RAM) -> AGGREGATES and TOTALS are calculated based on this view (unless 'unfiltered' is specified)
+
+# base_view is REQUIRED for every dashboard, and it must be declared before
+# the `aggregates` and `totals` sections below (the parser checks the raw
+# key order in this file, not just presence).
+#
+# It must be a single "CREATE [OR REPLACE] VIEW <name> AS SELECT ..." DDL
+# statement. The parser extracts <name>, executes the statement against
+# DuckDB at load time, and every aggregate/total query below MUST select
+# FROM that view name — they can no longer reference the original data
+# source table(s) directly. The parser rejects the dashboard (422) if any
+# aggregate/total query doesn't reference the view name.
+#
+# Why one flat view instead of letting every aggregate/total query the raw
+# source(s) directly? Because filters (button_filter, input_filter,
+# dropdown_*, ...) are applied as a single WHERE clause injected via a CTE
+# in front of each query — see ADR-011 in docs/backend_architecture.md.
+# That only works reliably if every query shares one column namespace (no
+# per-query aliases like `f.status` vs `fact.status`) and one set of joins
+# already resolved. This is the same "flat dataset, filters on top" pattern
+# most BI tools (Looker, PowerBI, Tableau) use under the name "semantic
+# layer" or "explore": authors do the joins/enrichment once in the view,
+# and every widget — plus every filter — targets that single shape, instead
+# of each aggregate author having to independently keep their query's
+# columns compatible with whatever filters might be applied to it.
+#
+# The base_view name must be system-wide unique (it becomes a real DuckDB
+# view name, dropped/recreated on dashboard reload or deletion).
+# If your data source is already query-ready, a trivial passthrough is
+# fine: "CREATE OR REPLACE VIEW my_dashboard_base AS SELECT * FROM my_table;"
+base_view: "CREATE OR REPLACE VIEW vuln_overview_base AS
+SELECT 
+    f.finding_id,
+    f.cve_id,
+    f.status,
+    f.is_overdue,
+    a.environment,
+    a.internet_exposed,
+    d.value_stream,
+    d.org_unit,
+    d.portfolio,
+    r.true_risk,
+    r.risk_category
+FROM read_parquet('/app/data/fact_finding_lifecycle/**/*.parquet', hive_partitioning = true) AS f
+LEFT JOIN dim_asset AS a 
+    ON f.asset_id = a.asset_id
+LEFT JOIN dim_dpm AS d 
+    ON a.dpm_id = d.dpm_id
+LEFT JOIN dim_risk AS r 
+    ON f.cve_id = r.cve_id;"
+
+
+aggregates:
+  - name: "snapcnt"
+    query: "SELECT status, COUNT(*) AS count FROM vuln_overview_base GROUP BY status"
+    unfiltered: true # If true, this aggregate will always be calculated based on the datasource. Applied filters will be ignored.
+  - name: "sankey_risk"
+    query: "SELECT 'Total' AS source, true_risk AS target, COUNT(*) AS value FROM vuln_overview_base GROUP BY true_risk"
+    # Sankey-shaped aggregate: one row per link (source -> target, value).
+    # See the `sankey` widget entry below.
+
+totals:
+# Totals are for single value results
+# If the query does not return one value, the total's value will be empty string ""
+  - name: "total_resources"
+    query: "SELECT COUNT(*) AS count FROM vuln_overview_base WHERE is_overdue = TRUE"
+
+  - name: "compliance"
+    query: "SELECT COUNT(*) FILTER (WHERE NOT is_overdue) * 100.0 / COUNT(*) AS count FROM vuln_overview_base"
+    unfiltered: true # If true, this total will always be calculated based on the datasource. Applied filters will be ignored.
+
+# Mappings allow to have UI references for specific DB column used in filters. 
+# Their main purpose is to prevent dislosing original FB fields in UI, especially if they are json sub-fields that would have special characters.
+mappings:
+  - "filter_dpm": "dpm->>'$.id'"
+  - "test": "asset->>'$.ip_address'"
+  - "test2": "column3"
+  - "snapshot_datetime": "snapshottime"
+
+layout: 
+    # Tile: Parsing requirements 
+    # Tile accepts only "Totals" not "Aggregates" or anything else
+    - tile: # Label with big font and value with big font.  
+        id: title_1
+        label: "Total Resources"
+        value: "total_resources" 
+        bg: #e9ebeb
+        grid: 
+            x: 0
+            y: 0
+            w: 1
+            h: 1
+            min_w: 1   # Recommended value: Cannot be squeezed smaller than X columns
+            min_h: 1
+    # Gauge full: Parsing requirements 
+    # Gauge full accepts only "Totals" not "Aggregates" or anything else
+    # Visual notes: Half circle. Value goes from 0 to 100. The value part is "filled" from left to right.
+    - radial_gauge_full:
+        id: gauge_resources_total
+        label: "Total Resources"
+        value: "20" # Example: It is allowed to specify string values directly without referencing the DB
+        grid: 
+            x: 1
+            y: 0
+            w: 1
+            h: 1
+            min_w: 1
+            min_h: 1
+    # Gauge semi: Parsing requirements 
+    # Gauge semi accepts only "Totals" not "Aggregates" or anything else
+    # Visual notes: Full circle. Value goes from 0 to 100. The value part is "filled". Starts from 12 o'clock 
+    - radial_gauge_semi:
+        id: gauge_compliance
+        label: "Compliant Resources %" 
+        value: "compliance" 
+        grid: 
+            x: 2
+            y: 0
+            w: 1
+            h: 1
+            min_w: 1
+            min_h: 1
+    # Pie chart: Parsing requirements 
+    # Pie chart allowed to use "Totals" and "Aggregates"
+    - pie_chart: #????????????????
+        id: my_pie
+        title: Total Donations by Category
+        fields:   # List of DB columns to use for the chart. 
+        - "Category Name": # Legend label
+            "table2.category_n"  # Reference to a Data_source name (aka table) or aggregate + column/fields name in it
+        - "Shoes amount": "table2.shoes"  # Reference to a Data_source name (aka table) or aggregate + column/fields name in it 
+        grid: 
+            x: 0
+            y: 1
+            w: 2
+            h: 2
+            min_w: 2 
+            min_h: 2
+    # bar_chart: Parsing requirements 
+    # bar_chart allowed to use "Aggregates" or original data source name (aka table name)
+    # Visual notes: First column used for x-axis labels, second for y-axis values
+    - bar_chart:
+        id: my_bar_donations
+        title: Donations vs Goal
+        data: table1.donations_vs_goal # Reference to a Data_source name (aka table) or aggregate + column/fields name in it
+        grid: 
+            x: 2
+            y: 1
+            w: 4
+            h: 2
+            min_w: 2
+            min_h: 2
+    # Sankey: Parsing requirements
+    # Sankey diagram accepts only "Aggregates" not "Totals", via the same
+    # `data` field every other aggregate-backed widget uses (bar_chart,
+    # pie_chart, basic_table, ...). The referenced aggregate's query must
+    # itself return {source, target, value} rows — one row per link in the
+    # flow. `source` is commonly a fixed root label if every link fans out
+    # from the same starting point, e.g.:
+    #   SELECT 'Total Vulnerabilities' AS source, true_risk AS target,
+    #          COUNT(*) AS value FROM vuln GROUP BY true_risk
+    - sankey:
+        id: true_risk_sankey
+        title: "SLB True Risk"
+        data: sankey_risk
+        grid:
+            x: 0
+            y: 3
+            w: 9
+            h: 3
+            min_w: 3
+            min_h: 2
+    # Basic table:: Parsing requirements 
+    # Basic table: accepts only "Aggregates" or data source.
+    # "columns" is an optional field. It allows to make cells in specific columns clickable URLs
+    # "on-row-click-panel" is an optional field. It allows to open a right side panel when a row is clicked, and to show only specific fields from the row there.
+    - basic_table: 
+        id: table_basic_1
+        title: "This is a table"
+        data: table1 
+        grid: 
+            x: 0
+            y: 6
+            w: 6
+            h: 3
+            min_w: 3
+            min_h: 2
+    # Example with clickable URLs
+    - basic_table: 
+        id: table_basic_1
+        title: "This is a table"
+        data: table1 # Reference to a Data_source name (aka table) or aggregate
+        grid: 
+            x: 6
+            y: 6
+            w: 3
+            h: 3
+            min_w: 3
+            min_h: 2
+        columns:
+            - field: "cve"           # The column name that need to become a clickable URL
+              type: "link"
+              url_field: "cve_url" # Uses value of a column "cve_url" as a URL
+              target: "_blank"
+            - field: "kev"           # The column name that need to become a clickable URL
+              type: "link"
+              url_field: "kev_url" # Uses value of a column "kev_url" as a URL
+              target: "_blank"
+    # Example with panel on row click
+    # Visual notes: The panel will show only specific fields from the row. The panel will have a title. Each field will have a label (as in "data" column header) and value. 
+    #   There will be a small copy-to-clipboard icon next to each value in the panel.
+    #   At the bottom of the panel there will be a small area where the whole row JSON is snown. Next to it will be a "Copy JSON" button which copies the JSON to clipboard. 
+    - basic_table: 
+        id: table_basic_1
+        title: "This is a table"
+        data: table1 # Reference to a Data_source name (aka table) or aggregate
+        on-row-click-panel:
+            title: "CVE Details"
+            fields: 
+                # Only these fields will show in the panel, in this order
+                - "cve"
+                - "true_risk"
+                - "fix_available"
+                - "finding_sources"
+        grid: 
+            x: 9
+            y: 6
+            w: 3
+            h: 3
+            min_w: 3
+            min_h: 2
+    - button_url:
+        id: button_click_it
+        label: "Click It"
+        url: "https://test.com/123213" 
+        height: 0.5 # Example: Button and empty space under it in one row (0.5+0.5=1)
+        grid: 
+            x: 0
+            y: 9
+            w: 1
+            h: 1
+            min_w: 1
+            min_h: 1
+    # Button filter: Parsing requirements
+    # Button can be used for filtering a datasource only (no aggregates or totals)
+    # Button filter supports operators: ge, le, eq, neq for numbers
+    # Button filter supports operators: ge, prefix, suffix, has, eq, neq for strings
+    # Visual representation: it is a toggle-like button with two states: ON/OFF.
+    - button_filter: # Toggle-like filter button.
+        id: button_filter_id
+        label: "Click It"
+        mapping: "test" # Data source field name to filter on
+        filter:
+            - operator: "ge"
+            - value: "10"
+        grid:
+            x: 1
+            y: 9
+            w: 1
+            h: 1
+            min_w: 1
+            min_h: 1
+    # Button filter with toggle_group: same widget, but adding `toggle_group`
+    # turns a set of standalone ON/OFF buttons into a mutually-exclusive
+    # radio-like group — only one button sharing the same toggle_group value
+    # can be active at a time (clicking one deactivates whichever sibling was
+    # active). Exactly the same toggle_group mechanism button_datetime_filter
+    # uses below, just with a fixed {operator, value} condition per button
+    # instead of a "last X minutes" filter.
+    #
+    # `default_active: true` makes a button (grouped or standalone) start
+    # selected on dashboard load, applying its condition before any click —
+    # typically the "ALL" button of a toggle_group, so the group reads as
+    # "everything, unfiltered" by default instead of nothing being selected.
+    # At most one button per toggle_group should set this.
+    - button_filter:
+        id: button_filter_scope_all
+        label: "ALL"
+        mapping: "test"
+        toggle_group: "scope"
+        default_active: true
+        filter:
+            - operator: "neq"
+            - value: "__never_matches__" # always-true condition == "no filter"
+        grid:
+            x: 2
+            y: 9
+            w: 1
+            h: 1
+            min_w: 1
+            min_h: 1
+    - button_filter:
+        id: button_filter_scope_a
+        label: "Option A"
+        mapping: "test"
+        toggle_group: "scope"
+        filter:
+            - operator: "eq"
+            - value: "A"
+        grid:
+            x: 3
+            y: 9
+            w: 1
+            h: 1
+            min_w: 1
+            min_h: 1
+    # Input filter: Parsing requirements
+    # Input filter on-type events will trigger filter. 
+    # Supports operators prefix, suffix, has, eq and neq since deals with strings. 
+    - input_filter: #
+        id: input_filter_test
+        label: "DPM ID"
+        mapping: "test" # Data source field name to filter on
+        filter:
+            - operator: "ge"
+            - value: "10" 
+        grid: 
+            x: 4
+            y: 9
+            w: 1
+            h: 1
+            min_w: 1
+            min_h: 1
+    - dropdown_multy: # Multi-select dropdown filter 
+        id: dropdown_multy_bu
+        mapping: "test2" # DB column (or mappings alias) this widget's selection filters on
+        unfiltered: true  # This dropdown will not be affected by filters
+        grid: 
+            x: 2
+            y: 9
+            w: 2
+            h: 1
+            min_w: 2
+            min_h: 1
+    - dropdown_single: # Single-select dropdown filter. This dropdown will be affected by filters
+        id: dropdown_single_dept
+        label: "Department"
+        mapping: "test" 
+        grid: 
+            x: 4
+            y: 9
+            w: 2
+            h: 1
+            min_w: 2
+            min_h: 1
+    - dropdown_multy: # Multi-select dropdown filter 
+        id: dropdown_multy_bu
+        data: "qure" # Aggregate or raw-source *name* whose rows populate the option list (not a literal query)
+        mapping: "test2" # DB column (or mappings alias) this widget's selection filters on
+        unfiltered: true  # This dropdown will not be affected by filters
+        grid: 
+            x: 2
+            y: 9
+            w: 2
+            h: 1
+            min_w: 2
+            min_h: 1
+    - dropdown_single: # Single-select dropdown filter. This dropdown will be affected by filters
+        id: dropdown_single_dept
+        label: "Department"
+        data: "qure" # Aggregate or raw-source *name* whose rows populate the option list (not a literal query)
+        mapping: "test" 
+        grid: 
+            x: 4
+            y: 9
+            w: 2
+            h: 1
+            min_w: 2
+            min_h: 1
+    # Line chart: Parsing requirements 
+    # Line chart allowed to use "Aggregates" or original data source name (aka table name)
+    # Visual notes: First column used for x-axis labels, second for y-axis values
+    - line_chart:
+        id: line_chart_compliance
+        title: "Compliance Trend"
+        data: aggr_table2 
+        grid: 
+            x: 0
+            y: 10
+            w: 5
+            h: 2
+            min_w: 2
+            min_h: 2
+    - widget_type: 
+        id: widget_id
+        title: Title here
+        data: paid_donations
+        grid: 
+            x: 5
+            y: 10 
+            w: 3
+            h: 2
+            min_w: 1
+            min_h: 1
+    # Two calendar selectors next to each other in line.
+    # Applies the filter to the DB fields in the mapping
+    # By default the endtime initialized to now() on page load
+    - widget_start_end_time:
+        id: widget_id
+        title: Range
+        mapping: "snapshot_datetime"
+        grid: 
+            x: 7
+            y: 0
+            w: 2
+            h: 1
+            min_w: 1
+            min_h: 1
+    # button_datetime_filter: will be for something like "Last 24 hours", "Last 7 days"
+    # Behaves like a toggle. When selected - it will stay highlighted, when unselected - it will go back to normal. 
+    # UI: Only one of the buttons in a toggle_group can be selected at a time!!!!
+    # Applies "last X minutes" to the field in mapping. No seconds supported - This application is not designed for real-time data.
+    - button_datetime_filter: # Toggle-like filter button.
+        id: button_filter_id
+        label: "Last 7 days"
+        mapping: "snapshot_datetime" 
+        toggle_group: "A"
+        filter: "172800" # 120 days in minutes
+        grid: 
+            x: 1
+            y: 9
+            w: 1
+            h: 1
+            min_w: 1
+            min_h: 1
+
+    # area_chart: Parsing requirements 
+    # area_chart allowed to use "Aggregates" or original data source name (aka table name)
+    - area_chart:
+        id: area_chart_compliance
+        title: "Area Trend"
+        data: aggr_table2 
+        grid: 
+            x: 1
+            y: 10
+            w: 5
+            h: 3
+            min_w: 2
+            min_h: 2
+    # horizontal_bar_chart: Parsing requirements
+    # horizontal_bar_chart allowed to use "Aggregates" or original data source name (aka table name)
+    # Visual notes: First column used for y-axis (category) labels, remaining
+    # numeric columns are plotted as bars along the x-axis (value axis).
+    - horizontal_bar_chart:
+        id: priorities_ver
+        title: Findings by priorities
+        data: table1.donations_vs_goal # Reference to a Data_source name (aka table) or aggregate + column/fields name in it
+        grid: 
+            x: 2
+            y: 13
+            w: 4
+            h: 2
+            min_w: 2
+            min_h: 2
+    # stacked_bar_chart: Parsing requirements
+    # stacked_bar_chart allowed to use "Aggregates" or original data source name (aka table name)
+    # Visual notes: same row shape as bar_chart (first column = x-axis
+    # category, remaining numeric columns = series), but each series is
+    # stacked into a single bar per category instead of grouped side-by-side.
+    - stacked_bar_chart:
+        id: priorities_sta
+        title: Findings by priorities
+        data: table1.donations_vs_goal # Reference to a Data_source name (aka table) or aggregate + column/fields name in it
+        grid: 
+            x: 2
+            y: 15
+            w: 4
+            h: 2
+            min_w: 2
+            min_h: 2
+    # stacked_horizontal_bar_chart: Parsing requirements 
+    # stacked_horizontal_bar_chart allowed to use "Aggregates" or original data source name (aka table name)
+    - stacked_horizontal_bar_chart:
+        id: priorities_sta_ver
+        title: Findings by priorities
+        data: table1.donations_vs_goal # Reference to a Data_source name (aka table) or aggregate + column/fields name in it
+        grid: 
+            x: 2
+            y: 17
+            w: 4
+            h: 2
+            min_w: 2
+            min_h: 2
+    # stacked_horizontal_bar_chart: Parsing requirements 
+    # stacked_horizontal_bar_chart allowed to use "Aggregates" or original data source name (aka table name)
+    # The data is organized as follows:
+    #    Column 1 - Outer group in the treemap
+    #    Column 2 - Inner group in the treemap
+    #    Column 3 - Value in the treemap
+    - treemap_chart:
+        id: priorities_treemap
+        title: Findings by department and application
+        data: table1.donations_vs_goal # Reference to a Data_source name (aka table) or aggregate + column/fields name in it
+        grid: 
+            x: 2
+            y: 19
+            w: 4
+            h: 2
+            min_w: 2
+            min_h: 2

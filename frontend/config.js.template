@@ -1,0 +1,2 @@
+window.API_BASE_URL = "${API_BASE_URL}";
+window.AUTH_BASE_URL = "${AUTH_BASE_URL}";

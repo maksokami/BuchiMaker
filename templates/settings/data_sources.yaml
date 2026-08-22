@@ -1,0 +1,5 @@
+- description: Synthetic sample orders dataset bundled for onboarding — safe to remove once you register your own data sources.
+  filepath: /app/data/orders_demo.csv
+  name: orders_demo
+  source_type: csv
+  title: Sample Orders

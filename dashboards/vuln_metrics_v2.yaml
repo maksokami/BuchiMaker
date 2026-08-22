@@ -1,0 +1,793 @@
+
+title: Vulnerability Overview Demo (Grid 12)
+id: slb_vuln_overview_v2 # Unique dashboard reference for API call
+grid_columns: 12 # 12 (default) or 24 — column count for the layout grid below
+# there is no auto-refresh defined
+# DPM
+# Asset Inventory
+# CVE knowledge base
+# SDR list
+# Quest exemption list
+
+# base_view flattens the finding-lifecycle fact table (parquet) with the
+# dpm/cve/assets/sdr/exemptions dimensions (all registered as plain DuckDB
+# tables by settings/data_sources.yaml — CSV for dpm/cve/assets/exemptions,
+# JSON for sdr) into one dashboard-wide shape. Every aggregate/total below
+# queries this view instead of the underlying sources directly — see
+# "base_view" in dashboards/template.yaml and ADR-011 in
+# docs/backend_architecture.md for why.
+#
+# This is a rewrite of vuln_metrics.yaml against the fact_finding_lifecycle
+# fact table instead of the old pre-flattened dim_*/data.parquet files and
+# the single wide 'vuln' CSV. Two things fell out of that:
+#
+# 1. slb_true_risk and vendor_risk_score (used for risk_category) are now
+#    columns on the fact row itself — no more per-cve MAX()/GROUP BY dedup
+#    join against 'vuln' just to get a risk number. Same for
+#    internet_exposed, which the fact row already carries per finding, so
+#    it no longer needs to come from `assets`.
+# 2. quest_exemption_id / sdr_exception_id on the fact table are 100% NULL
+#    for every row in the current data (checked directly against the
+#    parquet) — they're placeholder FK columns nothing populates yet. So
+#    exemptions/sdr below are NOT joined through those FKs; they're joined
+#    on the natural keys that actually exist in the raw sources:
+#      - exemptions (quest.csv): asset_id (unique per row, no dedup needed)
+#      - sdr (sdr.json): (DPMId, CVE) — sdr.json has no asset_id/asset
+#        identifier that matches anything in `assets` (checked: ResourceID
+#        doesn't match asset_platform_id or asset_external_provider_id for
+#        any row), so SDR decisions can only be resolved at the
+#        application+CVE grain here, not per-asset. Needs GROUP BY since a
+#        single (DPMId, CVE) SDR decision can list multiple ResourceIDs.
+#    `cve` (vuln_cve_flat.csv) also has duplicate cve_cve_id rows (full
+#    duplicates), deduped the same way.
+#
+# Only non-overlapping columns are pulled from each dimension (e.g. cve's
+# own cvss/severity are skipped since the fact row already has
+# cvss_score/cvss_severity/vendor_risk_score — epss_score and is_kev are
+# the CVE-table fields the fact row doesn't already carry).
+base_view: "CREATE OR REPLACE VIEW slb_vuln_overview_v2_base AS
+SELECT
+    f.slb_cvss_score,
+    f.vendor_risk_score,
+    f.slb_true_risk,
+    f.finding_id,
+    f.cve_id,
+    f.asset_id,
+    f.snapshot_date,
+    f.status,
+    f.is_overdue,
+    f.internet_exposed,
+	f.sla_days,
+    f.days_open,
+	f.quest_exemption_id,
+    a.asset_id,
+    a.asset_env,
+    a.asset_name,
+    a.asset_type,
+    a.asset_dpm_id,
+    a.asset_provider,
+    a.asset_category,
+    d.dpm_name,
+    d.dpm_tier,
+    d.dpm_status,
+    d.dpm_value_stream,
+    d.dpm_orgunit,
+    d.dpm_portfolio,
+    c.cve_cvss_score,
+    c.cve_cvss_severity,
+    c.cve_cvss_version,
+    c.cve_description,
+    c.cve_publishedDate,
+    c.cve_modified,
+    (e.exemption_id IS NOT NULL) AS is_exempted,
+    CASE
+        WHEN f.vendor_risk_score >= 90 THEN 'Critical'
+        WHEN f.vendor_risk_score >= 70 THEN 'High'
+        WHEN f.vendor_risk_score >= 40 THEN 'Medium'
+        WHEN f.vendor_risk_score >= 1 THEN 'Low'
+        ELSE 'Unknown/Out of bounds'
+    END AS risk_category
+FROM read_parquet('/app/data/fact_finding_lifecycle/**/*.parquet', hive_partitioning = true) AS f
+LEFT JOIN assets AS a
+    ON f.asset_id = a.asset_id
+LEFT JOIN dpm AS d
+    ON a.asset_dpm_id = d.dpm_id
+LEFT JOIN  cve as c
+    ON f.cve_id = c.cve_cve_id
+LEFT JOIN exemptions AS e
+    ON f.asset_id = e.asset_id;"
+
+aggregates:
+  # Sankey aggregates: each query returns {source, target, value} rows —
+  # one row per link in the flow — directly, matching the same `data`
+  # contract every other aggregate-backed widget uses. `source` is a fixed
+  # root label since every link in these diagrams fans out from the same
+  # starting point.
+  - name: "sankey_internet_exposure"
+    query: "SELECT 'Total Vulnerabilities' AS source, exposure_status AS target, vuln_count AS value FROM (SELECT CASE WHEN internet_exposed THEN 'Internet Exposed' ELSE 'Not exposed' END AS exposure_status, COUNT(*) AS vuln_count FROM slb_vuln_overview_v2_base WHERE status = 'Open'  GROUP BY 1) t;"
+  - name: "sankey_slb_risk"
+    query: "SELECT 'Total Vulnerabilities' AS source, slb_true_risk AS target, vuln_count AS value FROM (SELECT slb_true_risk, COUNT(*) AS vuln_count FROM slb_vuln_overview_v2_base WHERE status = 'Open'  GROUP BY slb_true_risk) t;"
+  - name: "sankey_vendor_risk"
+    query: "SELECT 'Total Vulnerabilities' AS source, risk_category AS target, vuln_count AS value FROM (SELECT risk_category, COUNT(*) AS vuln_count FROM slb_vuln_overview_v2_base  WHERE status = 'Open' GROUP BY risk_category) t;"
+  - name: "findings_by_value_stream"
+    query: "SELECT
+              COALESCE(dpm_value_stream, 'Unknown')        AS value_stream,
+              COUNT(*)                                  AS open_findings,
+              COUNT(*) FILTER (WHERE is_overdue)        AS overdue_findings,
+              ROUND(
+                  100.0 * COUNT(*) FILTER (WHERE is_overdue)
+                        / NULLIF(COUNT(*), 0),
+                  1
+              )                                         AS pct_overdue
+          FROM slb_vuln_overview_v2_base
+          WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+            AND status = 'Open'
+          GROUP BY COALESCE(dpm_value_stream, 'Unknown')
+          ORDER BY open_findings DESC;"
+  - name: "findings_open_by_slb_risk"
+    query: "SELECT
+            f.slb_true_risk,
+            COUNT(*)                              AS open_findings,
+            COUNT(*) FILTER (WHERE f.is_overdue)  AS overdue_findings
+        FROM slb_vuln_overview_v2_base AS f
+        WHERE f.snapshot_date = (
+            SELECT MAX(snapshot_date)
+            FROM slb_vuln_overview_v2_base
+        )
+        AND f.status = 'Open'
+        GROUP BY f.slb_true_risk
+        ORDER BY f.slb_true_risk;"
+  - name: "findings_by_org_unit"
+    query: "SELECT
+            COALESCE(dpm_orgunit, 'Unknown')              AS org_unit,
+            COUNT(*)                                    AS open_findings,
+            COUNT(*) FILTER (WHERE is_overdue)          AS overdue_findings,
+            ROUND(
+                100.0 * COUNT(*) FILTER (WHERE is_overdue)
+                      / NULLIF(COUNT(*), 0),
+                1
+            )                                           AS pct_overdue
+        FROM slb_vuln_overview_v2_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+          AND status = 'Open'
+        GROUP BY COALESCE(dpm_orgunit, 'Unknown')
+        ORDER BY open_findings DESC;"
+  - name: "findings_by_portfolio"
+    query: "SELECT
+            COALESCE(dpm_portfolio, 'Unknown')             AS portfolio,
+            COUNT(*)                                    AS open_findings,
+            COUNT(*) FILTER (WHERE is_overdue)          AS overdue_findings,
+            ROUND(
+                100.0 * COUNT(*) FILTER (WHERE is_overdue)
+                      / NULLIF(COUNT(*), 0),
+                1
+            )                                           AS pct_overdue
+        FROM slb_vuln_overview_v2_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+          AND status = 'Open'
+        GROUP BY COALESCE(dpm_portfolio, 'Unknown')
+        ORDER BY open_findings DESC;"
+  - name: "findings_by_age"
+    query: "WITH bucketed AS (
+                SELECT
+                    CASE
+                        WHEN days_open <   7 THEN '0-7d'
+                        WHEN days_open <  14 THEN '7-14d'
+                        WHEN days_open <  30 THEN '14-30d'
+                        WHEN days_open <  60 THEN '30-60d'
+                        WHEN days_open <  90 THEN '60-90d'
+                        WHEN days_open <= 180 THEN '90-180d'
+                        ELSE                        '180d+'
+                    END                            AS age_bucket,
+                    CASE
+                        WHEN days_open <   7 THEN 1
+                        WHEN days_open <  14 THEN 2
+                        WHEN days_open <  30 THEN 3
+                        WHEN days_open <  60 THEN 4
+                        WHEN days_open <  90 THEN 5
+                        WHEN days_open <= 180 THEN 6
+                        ELSE                        7
+                    END                            AS bucket_order,
+                    finding_id
+                FROM slb_vuln_overview_v2_base
+                WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+                AND status = 'Open'
+            )
+            SELECT
+                age_bucket,
+                COUNT(*)                           AS open_findings
+            FROM bucketed
+            GROUP BY age_bucket, bucket_order
+            ORDER BY bucket_order;"
+  - name: "findings_by_slb_risk"
+    query: "SELECT
+            slb_true_risk,
+            COUNT(*)                              AS open_findings,
+            COUNT(*) FILTER (WHERE is_overdue)    AS overdue_findings
+        FROM slb_vuln_overview_v2_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+        AND status = 'Open'
+        GROUP BY slb_true_risk
+        ORDER BY slb_true_risk;"
+  - name: "daily_open_vuln_by_slb_risk"
+    query: "SELECT
+                f.snapshot_date,
+                COUNT(*) FILTER (WHERE f.slb_true_risk = 1) AS p1,
+                COUNT(*) FILTER (WHERE f.slb_true_risk = 2) AS p2,
+                COUNT(*) FILTER (WHERE f.slb_true_risk = 3) AS p3,
+                COUNT(*) FILTER (WHERE f.slb_true_risk = 4) AS p4,
+                COUNT(*) FILTER (WHERE f.slb_true_risk = 5) AS p5,
+                COUNT(*) FILTER (WHERE f.slb_true_risk = 6) AS p6,
+                COUNT(*) FILTER (WHERE f.slb_true_risk = 7) AS p7,
+                COUNT(*) FILTER (WHERE f.slb_true_risk = 8) AS p8
+            FROM slb_vuln_overview_v2_base AS f
+            WHERE f.status        = 'Open'
+            AND f.snapshot_date >= (
+                SELECT MAX(snapshot_date) - INTERVAL '90 days'
+                FROM slb_vuln_overview_v2_base
+            )
+            GROUP BY f.snapshot_date
+            ORDER BY f.snapshot_date;"
+  - name: "top_cves"
+    query: "SELECT
+            f.cve_id,
+            strftime(epoch_ms(ANY_VALUE(f.cve_publishedDate)::BIGINT), '%Y-%m-%d') AS published_date,
+            ANY_VALUE(f.slb_true_risk) as slb_risk,  
+            ANY_VALUE(f.vendor_risk_score)  as vendor_risk,
+            ANY_VALUE(f.slb_cvss_score) as slb_cvss,
+            COUNT(*)  AS open_findings
+        FROM slb_vuln_overview_v2_base AS f
+        WHERE f.status        = 'Open'
+        AND f.snapshot_date = (
+            SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base
+        )
+        GROUP BY cve_id
+        ORDER BY open_findings DESC
+        LIMIT 20;"
+
+  - name: "filter_data_env"
+    query: "SELECT DISTINCT asset_env AS env FROM slb_vuln_overview_v2_base WHERE asset_env is not NULL ORDER BY asset_env DESC;"
+  - name: "filter_data_risk"
+    query: "SELECT DISTINCT slb_true_risk AS env FROM slb_vuln_overview_v2_base ORDER BY slb_true_risk ASC;"
+  - name: "top_apps"
+    query: "SELECT 	COALESCE(asset_dpm_id, 'unregistered') AS dpm_id,
+			COALESCE(dpm_name, 'Unknown')          AS dpm_name,
+			dpm_status                             AS app_status,
+			COUNT(*)                               AS total_findings,
+			COUNT(*) FILTER (WHERE slb_true_risk = 1)  AS p1_imminent_threat,
+			COUNT(*) FILTER (WHERE slb_true_risk = 2)  AS p2_critical,
+			COUNT(*) FILTER (WHERE slb_true_risk = 3)  AS p3_high_critical,
+			COUNT(*) FILTER (WHERE slb_true_risk = 4)  AS p4_high,
+			COUNT(*) FILTER (WHERE slb_true_risk = 5)  AS p5_medium_high,
+			COUNT(*) FILTER (WHERE slb_true_risk = 6)  AS p6_medium,
+			COUNT(*) FILTER (WHERE slb_true_risk = 7)  AS p7_low_medium,
+			COUNT(*) FILTER (WHERE slb_true_risk = 8)  AS p8_low
+		FROM slb_vuln_overview_v2_base
+		WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+		  AND status = 'Open'
+		GROUP BY
+			COALESCE(asset_dpm_id, 'unregistered'),
+			COALESCE(dpm_name, 'Unknown'),
+			dpm_status
+		ORDER BY total_findings DESC;"
+  - name: "top_apps_overdue"
+    query: "SELECT
+			COALESCE(asset_dpm_id, 'unregistered') AS dpm_id,
+			COALESCE(dpm_name, 'Unknown')          AS dpm_name,
+			dpm_status                             AS app_status,
+			COUNT(*)                               AS overdue_findings,
+			ROUND(AVG(days_open - sla_days), 1)    AS avg_days_past_sla,
+			MAX(days_open - sla_days)              AS max_days_past_sla,
+			COUNT(*) FILTER (WHERE slb_true_risk = 1)  AS p1_imminent_threat,
+			COUNT(*) FILTER (WHERE slb_true_risk = 2)  AS p2_critical,
+			COUNT(*) FILTER (WHERE slb_true_risk = 3)  AS p3_high_critical,
+			COUNT(*) FILTER (WHERE slb_true_risk = 4)  AS p4_high,
+			COUNT(*) FILTER (WHERE slb_true_risk = 5)  AS p5_medium_high,
+			COUNT(*) FILTER (WHERE slb_true_risk = 6)  AS p6_medium,
+			COUNT(*) FILTER (WHERE slb_true_risk = 7)  AS p7_low_medium,
+			COUNT(*) FILTER (WHERE slb_true_risk = 8)  AS p8_low
+		FROM slb_vuln_overview_v2_base
+		WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+		  AND status = 'Open'
+		  AND is_overdue = TRUE
+		GROUP BY
+			COALESCE(asset_dpm_id, 'unregistered'),
+			COALESCE(dpm_name, 'Unknown'),
+			dpm_status
+		ORDER BY overdue_findings DESC;"
+  - name: "top_apps_exemptions"
+    query: "SELECT
+			COALESCE(asset_dpm_id, 'unregistered') AS dpm_id,
+			COALESCE(dpm_name, 'Unknown')          AS dpm_name,
+			dpm_status                             AS app_status,
+			COUNT(DISTINCT quest_exemption_id)     AS active_exemption_count,
+			COUNT(*)                               AS exempted_finding_count
+		FROM slb_vuln_overview_v2_base
+		WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+		  AND status = 'Open'
+		  AND quest_exemption_id IS NOT NULL
+		GROUP BY
+			COALESCE(asset_dpm_id, 'unregistered'),
+			COALESCE(dpm_name, 'Unknown'),
+			dpm_status
+		ORDER BY active_exemption_count DESC;"
+  - name: "sankey_internet_exposure_assets"
+    query: "SELECT
+			CASE WHEN internet_exposed = true THEN 'Internet Exposed'
+				 ELSE 'Not Internet Exposed'
+			END                            AS source,
+			slb_true_risk as target,
+			COUNT(DISTINCT asset_id)       AS value
+		FROM slb_vuln_overview_v2_base
+		WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+		  AND status = 'Open'
+		GROUP BY
+			CASE WHEN internet_exposed = true THEN 'Internet Exposed'
+				 ELSE 'Not Internet Exposed'
+			END,
+			slb_true_risk
+		ORDER BY source, slb_true_risk;"
+  - name: "top_assets_findings"
+    query: "SELECT
+			asset_id,
+			asset_name,
+			asset_type,
+			COUNT(*)                                    AS total_open_findings,
+			COUNT(*) FILTER (WHERE slb_true_risk = 1) AS risk_1,
+			COUNT(*) FILTER (WHERE slb_true_risk = 2) AS risk_2,
+			COUNT(*) FILTER (WHERE slb_true_risk = 3) AS risk_3,
+			COUNT(*) FILTER (WHERE slb_true_risk = 4) AS risk_4,
+			COUNT(*) FILTER (WHERE slb_true_risk = 5) AS risk_5,
+			COUNT(*) FILTER (WHERE slb_true_risk = 6) AS risk_6,
+			COUNT(*) FILTER (WHERE slb_true_risk = 7) AS risk_7,
+			COUNT(*) FILTER (WHERE slb_true_risk = 8) AS risk_8
+		FROM slb_vuln_overview_v2_base
+		WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+		  AND status = 'Open'
+		GROUP BY asset_id, asset_name, asset_type
+		ORDER BY total_open_findings DESC
+		LIMIT 50;"
+  - name: "top_findings_by_asset_type"
+    query: "SELECT
+			COALESCE(asset_type, 'Unknown')   AS asset_type,
+			COUNT(*)                          AS open_findings,
+			COUNT(DISTINCT asset_id)          AS asset_count
+		FROM slb_vuln_overview_v2_base
+		WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+		  AND status = 'Open'
+		GROUP BY COALESCE(asset_type, 'Unknown')
+		ORDER BY open_findings DESC;"
+
+
+totals:
+# Totals are for single value results
+# If the query does not return one value, the total's value will be empty string ""
+  - name: "total_vulns"
+    query: "SELECT COUNT(*) FROM slb_vuln_overview_v2_base;"
+  - name: "vuln_assets"
+    query: "SELECT COUNT(DISTINCT asset_id) FROM slb_vuln_overview_v2_base WHERE status = 'Open' ;"
+  - name: "vuln_assets_internet_exposed"
+    query: "SELECT COUNT(DISTINCT asset_id) FROM slb_vuln_overview_v2_base WHERE internet_exposed and status = 'Open' ;"
+  - name: "vulns_internet_exposed"
+    query: "SELECT COUNT(*) FROM slb_vuln_overview_v2_base WHERE internet_exposed and status = 'Open';"
+  - name: "vulns_not_internet_exposed"
+    query: "SELECT COUNT(*) FROM slb_vuln_overview_v2_base WHERE NOT internet_exposed and status = 'Open';"
+  - name: "priority_one"
+    # slb_true_risk is BIGINT on the fact row (was a string comparison
+    # against the old 'vuln' CSV table before) — compare as an int now.
+    query: "SELECT COUNT(*) FROM slb_vuln_overview_v2_base WHERE slb_true_risk = 1 and status = 'Open';"
+  - name: "val_mttr"
+    query: "SELECT
+            ROUND( SUM(days_open)::DOUBLE / NULLIF(COUNT(*), 0), 1 )                     AS mttr_days
+        FROM slb_vuln_overview_v2_base
+        WHERE status = 'Closed'
+        AND snapshot_date >= (SELECT MAX(snapshot_date) - INTERVAL '30 days' FROM slb_vuln_overview_v2_base)"
+  - name: "closed_in_window"
+    query: "SELECT
+            COUNT(*) AS closed_findings_in_window
+        FROM slb_vuln_overview_v2_base
+        WHERE status = 'Closed'
+        AND snapshot_date >= (SELECT MAX(snapshot_date) - INTERVAL '30 days' FROM slb_vuln_overview_v2_base)"
+  - name: "vuln_apps"
+    query: "SELECT COUNT(DISTINCT asset_dpm_id) AS vulnerable_app_count
+        FROM slb_vuln_overview_v2_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+        AND status = 'Open';"
+  - name: "vuln_apps_exposed"
+    query: "SELECT COUNT(DISTINCT asset_dpm_id) AS internet_exposed_app_count
+        FROM slb_vuln_overview_v2_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+        AND status = 'Open'
+        AND internet_exposed = TRUE;"
+  - name: "quest_exemptions"
+    query: "SELECT COUNT(DISTINCT quest_exemption_id) AS active_exemption_count
+        FROM slb_vuln_overview_v2_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+        AND status = 'Open'
+        AND quest_exemption_id IS NOT NULL;"
+  - name: "exempted_findings"
+    query: "SELECT COUNT(*) AS exempted_finding_count
+        FROM slb_vuln_overview_v2_base
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM slb_vuln_overview_v2_base)
+        AND status = 'Open'
+        AND quest_exemption_id IS NOT NULL;"
+mappings:
+  - "slb_true_risk": "slb_true_risk"
+  - "environment": "asset_env"
+  - "snapshot": "snapshot_date"
+
+layout:
+  - tile: # Label with big font and value with big font.
+      id: vuln_assets_tile
+      label: "Assets"
+      value: "vuln_assets"
+      grid:
+          x: 0
+          y: 0
+          w: 2
+          h: 2
+          min_w: 2
+          min_h: 2
+  - tile: # Label with big font and value with big font.
+      id: vuln_exposed_assets_tile
+      label: "Internet Exposed Assets"
+      value: "vuln_assets_internet_exposed"
+      grid:
+          x: 2
+          y: 0
+          w: 2
+          h: 2
+          min_w: 1
+          min_h: 1
+  - tile: 
+      id: vuln_all
+      label: "Vulnerabilities"
+      value: "total_vulns"
+      grid:
+          x: 4
+          y: 0
+          w: 2
+          h: 2
+          min_w: 1
+          min_h: 1
+  - tile: # Label with big font and value with big font.
+      id: vuln_priority_one_tile
+      label: "SLB Highest Risk"
+      value: "priority_one"
+      grid:
+          x: 6
+          y: 0
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+  - tile: # Label with big font and value with big font.
+      id: tl_mttr
+      label: "MTTR"
+      value: "val_mttr"
+      grid:
+          x: 8
+          y: 0
+          w: 2
+          h: 2
+          min_w: 1
+          min_h: 1
+  - tile: # Label with big font and value with big font.
+      id: tile_closed_in_window
+      label: "Closed In Window"
+      value: "closed_in_window"
+      grid:
+          x: 10
+          y: 0
+          w: 2
+          h: 2
+          min_w: 1
+          min_h: 1
+  - dropdown_single: # Single-select dropdown filter. This dropdown will be affected by filters
+      id: dropdown_env
+      label: "Environment"
+      mapping: "environment"
+      data: filter_data_env
+      unfiltered: true
+      grid:
+          x: 0
+          y: 2
+          w: 3
+          h: 1
+          min_w: 1
+          min_h: 1
+  - dropdown_multy:
+      id: dropdown_slb_risk
+      label: "True Risk"
+      data: filter_data_risk
+      mapping: "slb_true_risk"
+      unfiltered: true
+      grid:
+          x: 3
+          y: 2
+          w: 3
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_datetime_filter:
+      id: btn_last_day
+      label: "Last day"
+      filter: "1440"
+      mapping: "snapshot"
+      toggle_group: "A"
+      grid:
+          x: 6
+          y: 2
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+  - button_datetime_filter:
+      id: btn_last_week
+      label: "Last week"
+      filter: "10080"
+      mapping: "snapshot"
+      toggle_group: "A"
+      grid:
+          x: 8
+          y: 2
+          w: 2
+          h: 1
+          min_w: 1
+          min_h: 1
+  - sankey:
+      id: internet_exposure_sankey
+      title: "Internet Exposure"
+      data: sankey_internet_exposure
+      grid:
+          x: 0
+          y: 3
+          w: 4
+          h: 5
+          min_w: 1
+          min_h: 1
+  - sankey:
+      id: vendor_risk_sankey
+      title: "Vendor Risk"
+      data: sankey_vendor_risk
+      grid:
+          x: 4
+          y: 3
+          w: 4
+          h: 5
+          min_w: 1
+          min_h: 1
+  - sankey:
+      id: slb_risk_sankey
+      title: "SLB True Risk"
+      data: sankey_slb_risk
+      grid:
+          x: 8
+          y: 3
+          w: 4
+          h: 5
+          min_w: 1
+          min_h: 1
+  - horizontal_bar_chart:
+      id: "slb_vulns_by_org"
+      title: "Findings by Org Unit"
+      data: findings_by_org_unit
+      grid:
+          x: 0
+          y: 8
+          w: 4
+          h: 7
+          min_w: 1
+          min_h: 1
+  - horizontal_bar_chart:
+      id: "slb_vulns_by_value_stream"
+      title: "Findings by Value Stream"
+      data: findings_by_value_stream
+      grid:
+          x: 4
+          y: 8
+          w: 4
+          h: 7
+          min_w: 1
+          min_h: 1
+  - horizontal_bar_chart:
+      id: "slb_vulns_by_portf"
+      title: "Findings by Portfolio"
+      data: findings_by_portfolio
+      grid:
+          x: 8
+          y: 8
+          w: 4
+          h: 7
+          min_w: 1
+          min_h: 1
+  - horizontal_bar_chart:
+      id: "slb_vulns_age_distribution"
+      title: "Findings Age Distribution"
+      data: findings_by_age
+      grid:
+          x: 0
+          y: 15
+          w: 4
+          h: 7
+          min_w: 1
+          min_h: 1
+  - area_chart:
+      id: "slb_daily_by_true_risk"
+      title: "Daily findings by slb true risk"
+      data: daily_open_vuln_by_slb_risk
+      grid: 
+          x: 4
+          y: 15
+          w: 8
+          h: 4
+          min_w: 2
+          min_h: 2
+  - bar_chart:
+       id: "slb_open_findings_by_slb_risk"
+       title: "Open findings by SLB True Risk"
+       data: findings_open_by_slb_risk
+       grid: 
+          x: 4
+          y: 19
+          w: 8
+          h: 3
+          min_w: 2
+          min_h: 2
+  - basic_table:
+       id: "tbl_top_cves"
+       title: "Top findings"
+       data: top_cves
+       grid:
+          x: 0
+          y: 22
+          w: 8
+          h: 4
+          min_w: 2
+          min_h: 2
+  - bar_chart:
+       id: "slb_findings_by_slb_risk"
+       title: "Open findings by SLB True Risk"
+       data: findings_by_slb_risk
+       grid: 
+          x: 0
+          y: 26
+          w: 6
+          h: 4
+          min_w: 2
+          min_h: 2
+  - tile: 
+       id: "slb_vulne_apps_count"
+       label: "Vulnerable Apps"
+       value: vuln_apps
+       grid: 
+          x: 6
+          y: 26
+          w: 2
+          h: 2
+          min_w: 2
+          min_h: 2
+  - tile: 
+       id: "slb_vuln_apps_exposed_count"
+       label: "Exposed Vulnerable Apps"
+       value: vuln_apps_exposed
+       grid: 
+          x: 8
+          y: 26
+          w: 2
+          h: 2
+          min_w: 2
+          min_h: 2
+  - tile: 
+       id: "slb_active_exemptions"
+       label: "Active Exemptions"
+       value: quest_exemptions
+       grid: 
+          x: 10
+          y: 26
+          w: 2
+          h: 2
+          min_w: 2
+          min_h: 2
+  - tile: 
+       id: "slb_active_sdr_findings"
+       label: "SDR Applied Findings"
+       value: "0"
+       grid: 
+          x: 8
+          y: 28
+          w: 2
+          h: 2
+          min_w: 2
+          min_h: 2
+  - tile: 
+       id: "slb_active_exempted_findings"
+       label: "Exempted Findings"
+       value: exempted_findings
+       grid: 
+          x: 10
+          y: 28
+          w: 2
+          h: 2
+          min_w: 2
+          min_h: 2
+  - basic_table:
+       id: "tbl_top_apps"
+       title: "Top Apps"
+       data: top_apps
+       grid:
+          x: 0
+          y: 30
+          w: 12
+          h: 6
+          min_w: 2
+          min_h: 2
+  - basic_table:
+       id: "tbl_top_apps_overdue"
+       title: "Top Apps with overdue"
+       data: top_apps_overdue
+       grid:
+          x: 0
+          y: 36
+          w: 12
+          h: 6
+          min_w: 2
+          min_h: 2
+  - basic_table:
+       id: "tbl_top_apps_by_exemptions"
+       title: "Top Apps by exemptions"
+       data: top_apps_exemptions
+       grid:
+          x: 0
+          y: 42
+          w: 12
+          h: 6
+          min_w: 2
+          min_h: 2
+  - sankey:
+      id: internet_exposure_sankey_assets
+      title: "Internet Exposure by Assets"
+      data: sankey_internet_exposure_assets
+      grid:
+          x: 0
+          y: 48
+          w: 4
+          h: 5
+          min_w: 1
+          min_h: 1
+  - pie_chart: 
+      id: my_pie
+      title: "findings by asset type 2"
+      data: top_findings_by_asset_type
+      grid: 
+          x: 4
+          y: 48
+          w: 5
+          h: 5
+          min_w: 2 
+          min_h: 2
+  - basic_table:
+       id: "tbl_top_assets_by_findings"
+       title: "Top Assets by findings"
+       data: top_assets_findings
+       grid:
+          x: 0
+          y: 53
+          w: 7
+          h: 6
+          min_w: 2
+          min_h: 2
+  - basic_table:
+       id: "6e25ee46-a61d-42e5-9ea6-19865c911232"
+       title: "Top findings by asset type"
+       data: top_findings_by_asset_type
+       grid:
+          x: 7
+          y: 53
+          w: 5
+          h: 6
+          min_w: 2
+          min_h: 2
+
+
+

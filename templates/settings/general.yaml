@@ -1,0 +1,18 @@
+active_widget_set: default
+auto_refresh: null
+redis_host: null
+redis_password: null
+redis_port: null
+redis_tls_enabled: null
+redis_ttl_seconds: 1800
+redis_user: null
+row_limit: 1000
+sql_api_enabled: true
+syslog:
+  ca_cert_path: null
+  cert_path: null
+  enabled: false
+  host: null
+  key_path: null
+  port: null
+  tls_enabled: false
