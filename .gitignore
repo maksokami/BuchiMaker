@@ -5,11 +5,13 @@ dist/
 
 ## App specific
 # Data Sources
+dashboards/
 data/*
 db/*
 backend/db/*
 backend/settings/*
 settings/*
+
 # Temporary
 scan.md
 .archive
@@ -19,6 +21,7 @@ skills/
 specify/
 .agents/
 .opencode/
+.vscode/
 
 ## Agent specific files
 .codex/*
@@ -196,3 +199,4 @@ poetry.toml
 
 # LSP config files
 pyrightconfig.json
+test.zip

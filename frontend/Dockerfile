@@ -17,7 +17,7 @@ COPY config.js.template /usr/share/nginx/html/
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 COPY entrypoint.sh /
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Expose port 80
 EXPOSE 80

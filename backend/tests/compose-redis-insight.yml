@@ -1,0 +1,18 @@
+services:
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: buchi-redisinsight
+    restart: unless-stopped
+    ports:
+      - "${REDISINSIGHT_HOST_PORT:-5540}:5540"
+    volumes:
+      - redisinsight_data:/data
+    networks:
+      - buchi-net
+
+volumes:
+  redisinsight_data:
+
+networks:
+  buchi-net:
+    name: buchi-net

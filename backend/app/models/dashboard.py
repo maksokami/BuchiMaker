@@ -271,16 +271,24 @@ class Filter:
                 parts.append(f"{field} {op} '{val}'")
         return " AND ".join(parts)
 
-    def refresh(self) -> None:
-        """Rebuild the filtered DuckDB view from the base table.
+    def refresh(self, con: Optional[Any] = None) -> None:
+        """Rebuild the filtered DuckDB table from the base table.
 
         Should be called at startup and every refresh_frequency minutes.
+
+        Args:
+            con: DuckDB connection to build the table against. Defaults to
+                the active connection (``get_db()``); callers rebuilding
+                data ahead of a promotion (see
+                ``SystemManager.global_refresh``) pass the standby
+                connection explicitly so the filter table exists in the new
+                active slot immediately after promotion.
         """
-        con = get_db()
+        _con = con if con is not None else get_db()
         where = self._build_where_clause()
         with get_write_lock():
-            con.execute(f"DROP TABLE IF EXISTS {self.view_name}")
-            con.execute(
+            _con.execute(f"DROP TABLE IF EXISTS {self.view_name}")
+            _con.execute(
                 f"CREATE TABLE {self.view_name} AS "
                 f"SELECT * FROM {self.source_table} WHERE {where}"
             )
@@ -376,6 +384,7 @@ class Dashboard:
         self.description: Optional[str] = None
         self.prompt: Optional[str] = None
         self.source_table: str = ""
+        self.base_view_sql: str = ""
         self.filters: Dict[str, Filter] = {}
         self.summaries: List[Summary] = []
         self.aggregates: List[Aggregate] = []
@@ -491,10 +500,9 @@ class Dashboard:
         except ValueError as exc:
             return f"Validation error: {exc}"
 
-        con = get_db()
+        self.base_view_sql = base_view_sql
         try:
-            with get_write_lock():
-                con.execute(base_view_sql.rstrip(";"))
+            self.recreate_base_view(get_db())
         except Exception as exc:
             return f"base_view creation failed: {exc}"
 
@@ -1561,6 +1569,31 @@ class Dashboard:
         with get_write_lock():
             con.execute(f"DROP VIEW IF EXISTS {self.source_table}")
         _logger.info("base_view_dropped", view=self.source_table)
+
+    def recreate_base_view(self, con: Optional[Any] = None) -> None:
+        """(Re-)execute this dashboard's stored ``base_view`` DDL against ``con``.
+
+        Args:
+            con: DuckDB connection to create the view against. Defaults to
+                the active connection (``get_db()``); callers rebuilding
+                data ahead of a promotion (see
+                ``SystemManager.global_refresh``) pass the standby
+                connection explicitly so the view exists in the new active
+                slot immediately after promotion — otherwise the view (and
+                anything selecting from it) would only exist in whichever
+                slot happened to be active when the dashboard was loaded.
+
+        Raises:
+            RuntimeError: If ``base_view_sql`` hasn't been set yet (i.e.
+                ``load_yaml`` was never called successfully).
+        """
+        if not self.base_view_sql:
+            raise RuntimeError(
+                f"Dashboard '{self.id}' has no base_view_sql to recreate."
+            )
+        _con = con if con is not None else get_db()
+        with get_write_lock():
+            _con.execute(self.base_view_sql.rstrip(";"))
 
     def widget_count(self) -> int:
         """Return total number of declared widgets (summaries + aggregates).

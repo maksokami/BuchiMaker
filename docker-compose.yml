@@ -140,4 +140,5 @@ services:
 
 networks:
   buchi-net:
+    name: buchi-net
     driver: bridge

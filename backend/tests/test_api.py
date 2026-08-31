@@ -733,6 +733,55 @@ class TestDashboardsAPI:
 
 
 # ---------------------------------------------------------------------------
+# global_refresh() active/standby symmetry (see ADR-016 in
+# docs/backend_architecture.md)
+# ---------------------------------------------------------------------------
+
+class TestGlobalRefreshBaseViewSymmetry:
+    """Regression tests: a dashboard's base_view must survive a
+    global_refresh() promotion cycle.
+
+    global_refresh() loads fresh connector tables into the *standby*
+    DuckDB slot and promotes it to active. Dashboards' base_views are
+    normally only (re)created against get_db() (whichever slot is active
+    at load time), so without recreating them against the standby
+    connection first, a promotion would silently leave the new active
+    slot without any dashboard's base_view — every total/aggregate query
+    would start failing right after a refresh until the dashboard was
+    reloaded.
+    """
+
+    def _load_orders_source(self, client, csv_file):
+        client.post("/api/v1/system/data-sources/csv", json={
+            "name": "orders",
+            "title": "Orders",
+            "filepath": csv_file,
+        })
+
+    def test_base_view_queryable_after_second_global_refresh(
+        self, client, csv_file, dashboard_yaml
+    ):
+        """A dashboard loaded before a second global_refresh() can still be
+        queried afterwards, against the newly-promoted active connection."""
+        self._load_orders_source(client, csv_file)
+        resp = client.post("/api/v1/dashboards/load", json={"filepath": dashboard_yaml})
+        assert resp.status_code == 200
+
+        dash = system_manager.dashboards["api_test_dash"]
+        assert dash.source_table  # base_view was created against the first active slot
+
+        # Triggers another load-into-standby + promote cycle. Before the
+        # fix, base_views were never recreated against the standby
+        # connection, so the dashboard's view would only exist in whatever
+        # slot is demoted to standby by this call.
+        system_manager.global_refresh(rate_limit=False)
+
+        resp = client.post("/api/v1/dashboards/api_test_dash/data", json={"filters": {}})
+        assert resp.status_code == 200
+        assert resp.json()["totals"]["total_orders"] == 3
+
+
+# ---------------------------------------------------------------------------
 # POST /data — unified filter + data endpoint
 # ---------------------------------------------------------------------------
 

@@ -37,6 +37,10 @@ seed_dir "templates/dashboards" "dashboards"
 seed_dir "templates/data" "data"
 seed_dir "templates/settings" "settings"
 
+echo "Create settings and db folders"
+mkdir settings
+mkdir db
+
 echo
 echo "Done. Nothing here is overwritten on re-run — delete a file first if you want it reseeded from templates/."
 echo "Next: docker compose up --build"

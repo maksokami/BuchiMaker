@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from app.core.db import close_db, get_db
+from app.core.db import close_db, get_db, get_standby_db
 from app.models.dashboard import Aggregate, Dashboard, Filter, Summary
 
 
@@ -152,6 +152,32 @@ class TestFilter:
         assert not f.is_loaded
         with pytest.raises(Exception):
             get_db().execute(f"SELECT 1 FROM {f.view_name}").fetchall()
+
+    def test_refresh_against_explicit_connection(self):
+        """refresh(con=...) rebuilds the table against the given connection
+        instead of the active one — used by SystemManager.global_refresh() to
+        keep the standby slot's cached filter tables in sync before promotion
+        (see ADR-016 in docs/backend_architecture.md)."""
+        standby = get_standby_db()
+        standby.execute("""
+            CREATE TABLE test_data AS
+            SELECT * FROM (VALUES
+                (1, 'alpha', 100, TRUE),
+                (2, 'beta',  200, FALSE)
+            ) t(id, category, amount, active)
+        """)
+        f = Filter(
+            filter_conditions=[{"field": "active", "operator": "=", "value": "true"}],
+            source_table="test_data",
+            filter_hash="standby_test",
+        )
+        f.refresh(con=standby)
+        assert f.is_loaded
+        # Not visible on the active connection — it was only built on standby.
+        with pytest.raises(Exception):
+            get_db().execute(f"SELECT 1 FROM {f.view_name}").fetchall()
+        rows = standby.execute(f"SELECT COUNT(*) FROM {f.view_name}").fetchone()
+        assert rows[0] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +668,41 @@ base_view: "CREATE OR REPLACE VIEW bv_drop_base AS SELECT * FROM test_data;"
         dash.drop_base_view()
         with pytest.raises(Exception):
             get_db().execute("SELECT 1 FROM bv_drop_base").fetchall()
+
+    def test_recreate_base_view_against_explicit_connection(self, tmp_path):
+        """recreate_base_view(con) (re-)executes the stored base_view DDL
+        against the given connection instead of the active one — used by
+        SystemManager.global_refresh() to keep the standby slot's base_views
+        in sync before promotion (see ADR-016 in docs/backend_architecture.md)."""
+        yaml_content = """
+id: bv_recreate
+title: Recreate Base View
+base_view: "CREATE OR REPLACE VIEW bv_recreate_base AS SELECT * FROM test_data;"
+"""
+        filepath = self._write_yaml(tmp_path / "bv_recreate.yaml", yaml_content)
+        dash = Dashboard()
+        dash.load_yaml(filepath)
+
+        standby = get_standby_db()
+        # A fresh standby connection/file doesn't have the view (or even the
+        # underlying table) until it's explicitly (re)built there.
+        with pytest.raises(Exception):
+            standby.execute(f"SELECT 1 FROM {dash.source_table}").fetchall()
+
+        standby.execute("""
+            CREATE TABLE test_data AS
+            SELECT * FROM (VALUES (1, 'alpha', 100, TRUE)) t(id, category, amount, active)
+        """)
+        dash.recreate_base_view(standby)
+        rows = standby.execute(f"SELECT COUNT(*) FROM {dash.source_table}").fetchall()
+        assert rows[0][0] == 1
+
+    def test_recreate_base_view_without_load_yaml_raises(self):
+        """recreate_base_view() on a Dashboard that never loaded a YAML
+        (no base_view_sql stored yet) raises rather than silently no-oping."""
+        dash = Dashboard()
+        with pytest.raises(RuntimeError):
+            dash.recreate_base_view()
 
 
 # ---------------------------------------------------------------------------

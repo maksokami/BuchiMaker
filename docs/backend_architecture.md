@@ -88,14 +88,19 @@ SystemManager  (singleton in app/models/system_manager.py)
 │  └── health_summary() → Dict
 
 Dashboard  (app/models/dashboard.py)
-│  ├── id, name, description, prompt, source_table
+│  ├── id, name, description, prompt, source_table, base_view_sql
 │  │     └── source_table is NOT read from YAML directly — it's the view
 │  │         name extracted from the required `base_view` DDL and set once
-│  │         that DDL is executed against DuckDB in load_yaml(). See "Filter
-│  │         Pipeline" and ADR-011.
+│  │         that DDL is executed against DuckDB in load_yaml(). base_view_sql
+│  │         is the raw DDL text, kept around so it can be re-executed later
+│  │         (see recreate_base_view() below and ADR-011/ADR-016).
 │  ├── summaries: List[Summary]
 │  ├── aggregates: List[Aggregate]
-│  ├── filters: Dict[hash, Filter]        ← legacy view-based cache (background refresh)
+│  ├── filters: Dict[hash, Filter]        ← legacy view-based cache — currently
+│  │     unpopulated in normal operation: no API route calls set_filters()
+│  │     any more (the live `POST /data` path uses inline CTE filtering, see
+│  │     ADR-002); only the background refresh thread still touches this dict
+│  │     via refresh_filters()/trim_filters(), which are no-ops while it's empty.
 │  ├── mappings: Dict[str, str]           ← widget_id alias → DB column expression
 │  ├── layout: List[Dict]                 ← parsed widget definitions
 │  ├── settings: {refresh_frequency_filter, unallocate_frequency_filter}
@@ -103,25 +108,28 @@ Dashboard  (app/models/dashboard.py)
 │  │     └── executes `base_view`, validates every total/aggregate query
 │  │         references the resulting view name                 ← NEW
 │  ├── drop_base_view() → None            ← NEW (called on delete/rename)
+│  ├── recreate_base_view(con=None) → None  ← NEW (re-executes base_view_sql
+│  │         against any connection; used by global_refresh() — see ADR-016)
 │  ├── parse_widget_filters(raw_filters) → (conditions, hash)   ← NEW
 │  ├── get_data_for_filters(conditions, row_limit) → Dict       ← NEW
 │  ├── _build_widget_map() → List[Dict]                         ← NEW
 │  ├── _raw_sources_needed() → List[str]                        ← NEW
 │  ├── _build_sql_where(conditions) → str                       ← NEW
-│  ├── set_filters(conditions) → Filter    ← legacy (background thread)
+│  ├── set_filters(conditions) → Filter    ← legacy, currently unused (see above)
 │  ├── trim_filters() → int
 │  ├── refresh_filters()
-│  ├── get_dashboard_data(filter_hash?, truncate_mb) → Dict     ← legacy
+│  ├── get_dashboard_data(filter_hash?, truncate_mb) → Dict     ← legacy, currently unused
 │  ├── get_dashboard_definition() → Dict
 │  ├── list_virtual_tables() → List[str]
 │  └── widget_count() → int
 
-Filter  (legacy, one per unique filter combination — used by background refresh thread)
+Filter  (legacy, one per unique filter combination — see the `filters` note above)
 │  ├── id, name, filter_hash, view_name (DuckDB view)
 │  ├── filter_conditions, source_table, is_loaded
 │  ├── last_refreshed, last_queried (epoch)
 │  ├── is_fresh() → bool
-│  ├── refresh()            ← (re)builds DuckDB view
+│  ├── refresh(con=None)    ← (re)builds the filter table; con lets
+│  │         global_refresh() target the standby connection (ADR-016)
 │  ├── get_data(truncate_mb) → Dict
 │  └── drop()
 
@@ -719,10 +727,10 @@ ConnectorRegistry.register(S3Connector)
 
 ## Architecture Decisions
 
-### ADR-001: Single DuckDB connection
-- **Decision**: One DuckDB connection (file-backed via `DUCKDB_DATABASE`) per process with a `threading.Lock`. Using local files instead of `:memory:` allows the OS to handle heavy memory paging dynamically, keeping CPU usage stable during background reloads without disrupting active queries.
-- **Rationale**: DuckDB is optimised for single-process multi-read. Cross-process sharing is not supported.
-- **Trade-off**: No horizontal scaling for write-heavy workloads without stateless redesign.
+### ADR-001: Active/standby double-buffered DuckDB connections
+- **Decision**: Two file-backed DuckDB connections per process (`app/core/db.py`), not one — an "active" slot serving all reads/writes and a "standby" slot on a second fixed-path file (`DUCKDB_DATABASE`/`DUCKDB_DATABASE_STANDBY`). `SystemManager.global_refresh()` loads fresh connector data into the standby connection, then `promote_standby()` swaps it in as the new active connection (validating it with a read-only reopen first); the previous active connection becomes the new standby after a short grace period, ready for the next refresh. A `threading.RLock` (`get_write_lock()`) serialises DDL. Using local files instead of `:memory:` allows the OS to handle heavy memory paging dynamically, keeping CPU usage stable during background reloads without disrupting active queries.
+- **Rationale**: DuckDB is optimised for single-process multi-read; a data-source reload (`DROP`/`CREATE` of every connector's table) can't safely happen against the same connection that's serving live reads. The active/standby swap lets a refresh build entirely fresh tables in the background and only becomes visible to readers at the atomic moment of promotion — readers never see a half-reloaded, inconsistent state, and a refresh that fails partway through never gets promoted at all (the old active connection just keeps serving).
+- **Trade-off**: No horizontal scaling for write-heavy workloads without stateless redesign. Also, anything that mutates DuckDB schema *outside* of `global_refresh()` — dashboards' `base_view`s and the legacy `Filter` class's materialized tables — is normally only created against `get_db()` (whichever slot is active at that moment), so without deliberately reproducing it into the standby connection before each promotion, it would only ever exist in whichever slot happens to be active when it was last touched. See ADR-016 for the fix.
 
 ### ADR-002: Inline CTE filters (no per-request/per-filter DuckDB views)
 - **Decision**: `POST /data` applies filters via `WITH __filtered AS (SELECT * FROM {table} WHERE {conditions})` CTEs, injected into each query at runtime.  No DuckDB `VIEW` objects are created per API request or per filter combination.
@@ -798,3 +806,10 @@ ConnectorRegistry.register(S3Connector)
 - **Why no configurable default role for unmapped users**: The pre-existing frontend mockup (`Settings.js`'s original hardcoded `accessDefaultRole`) suggested one, but the actual requirement is fail-closed: any OIDC-authenticated caller matching none of the configured claim mappings is always `Deny`. This removes an entire class of misconfiguration (an admin leaving the default role more permissive than intended) at the cost of requiring at least one explicit mapping before any real user can do anything beyond viewing an empty app.
 - **Verification**: `tests/test_auth.py` — claim/role resolution (`TestResolveRoleFromClaims`), the `anonymous_access` short-circuit and its unconditional override of any existing session (`TestAnonymousAccess`), the full role-gating matrix end-to-end via `TestClient` with synthetic Redis-backed sessions (`TestRoleGating`), and the Access/SSO settings persistence + secret-masking round-trip (`TestAccessAndSsoSettingsPersistence`).
 - **Verification**: both lockfiles installed cleanly with `pip install --require-hashes` into a clean venv, the full test suite (238 tests) passed against that venv, and `docker compose build backend` + a live container boot (`/healthz`, dashboard/data-source loading) succeeded on the newly-pinned versions.
+
+### ADR-016: Recreate `base_view`/filter tables against the standby connection before promotion
+- **Decision**: `SystemManager.global_refresh()`'s `_do_refresh()` now, after loading every connector's table into the standby connection and before calling `promote_standby()`: (1) re-executes every registered dashboard's stored `base_view` DDL (`Dashboard.recreate_base_view(con)`, new method — the DDL text is now kept on the `Dashboard` object as `base_view_sql` specifically so it can be replayed later) against that same standby connection, aborting the refresh/promotion if any fails; then (2) rebuilds every currently-loaded legacy `Filter` table (`Filter.refresh(con=...)`, now accepts an explicit connection) against the standby connection too, dropping from the cache (and logging) any individual filter that fails to rebuild rather than aborting the whole refresh.
+- **Rationale**: `base_view`s and `Filter` tables are otherwise only ever (re)created against `get_db()` — whichever slot is *active* at the moment a dashboard is loaded or a filter is queried. `global_refresh()` only ever touched connector tables in the standby slot before promoting it, so a dashboard's `base_view` (and any legacy filter table) only ever existed in the *original* active connection. After a promotion, that connection becomes the new standby — the new active slot would have fresh connector data but be missing every dashboard's `base_view` entirely, breaking every total/aggregate query (`get_data_for_filters` selects from `base_view`) until each dashboard happened to be reloaded again. This was found by tracing why active/standby DuckDB file sizes diverged wildly over time (the demoted slot kept accumulating `base_view`s/filter tables that a promotion never carried forward) — see session history for the original diagnosis.
+- **Ordering matters**: connector tables load first (so `base_view`'s `SELECT` has fresh data to reference), then `base_view`s (which `SELECT FROM` those tables), then filter tables (which `SELECT FROM` the just-recreated `base_view`s) — each step depends on the previous one already existing in the standby connection.
+- **Current practical impact**: the legacy `Filter`/`dash.filters` half of this fix is defensive/future-proofing rather than live-exercised — no API route currently calls `Dashboard.set_filters()` (the live `POST /data` path uses ADR-002's inline CTE filtering instead), so `dash.filters` is normally empty and that loop is a no-op. The `base_view` half is the one that matters today: every dashboard depends on it.
+- **Verification**: `tests/test_dashboard.py::TestFilter::test_refresh_against_explicit_connection`, `TestDashboardBaseView::test_recreate_base_view_against_explicit_connection` / `test_recreate_base_view_without_load_yaml_raises` (unit-level, both methods against an explicit connection); `tests/test_api.py::TestGlobalRefreshBaseViewSymmetry::test_base_view_queryable_after_second_global_refresh` (integration-level regression test — loads a dashboard, forces a second `global_refresh()`, and asserts `POST /data` still succeeds against the newly-promoted active connection).

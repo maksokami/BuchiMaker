@@ -217,6 +217,41 @@ class SystemManager:
                 # own DROP/CREATE.
                 raise RuntimeError(f"Data source load failed: {e}")
 
+            # Dashboards' base_views and cached filter tables are normally
+            # only (re)created against get_db() (whichever slot is active
+            # at the time), so without this they'd only ever exist in the
+            # slot that was active when they were last touched — never
+            # reproduced into standby before a promotion. Rebuild them here,
+            # against the same standby connection the fresh data just
+            # landed in, so the new active slot is immediately consistent.
+            try:
+                for dash in self.dashboards.values():
+                    if dash.source_table:
+                        dash.recreate_base_view(con)
+            except Exception as e:
+                raise RuntimeError(f"base_view recreation failed: {e}")
+
+            for dash in self.dashboards.values():
+                stale_hashes = []
+                for filter_hash, f in dash.filters.items():
+                    if not f.is_loaded:
+                        continue
+                    try:
+                        f.refresh(con=con)
+                    except Exception as e:
+                        # A single filter combination failing to rebuild
+                        # (e.g. a field it filters on was dropped) shouldn't
+                        # block the whole refresh — drop it from the cache
+                        # so it's lazily rebuilt against the new active
+                        # connection the next time it's queried.
+                        _logger.warning(
+                            "filter_refresh_failed_during_global_refresh",
+                            dashboard=dash.id, filter=f.name, error=str(e),
+                        )
+                        stale_hashes.append(filter_hash)
+                for filter_hash in stale_hashes:
+                    del dash.filters[filter_hash]
+
             promote_standby()
 
             # Clean Redis cache for all sources
