@@ -1,17 +1,19 @@
 # BuchiMaker
 
-<table>
-  <tr>
-    <td width="40%" align="left">
-      <img src="./img/icon.png" alt="BuchiMaker logo" width="130">
-    </td>
-    <td width="60%" align="center">
+<img src="./img/icon.png" alt="BuchiMaker" width="130" align="left">
 
-![License](https://img.shields.io/badge/License-GPL%203.0-blue)  
-![Vue 3](https://img.shields.io/badge/Vue.js-4FC08D?style=flat&logo=vue.js&logoColor=white) ![GridStack](https://img.shields.io/badge/GridStack.js-7D2FED) ![FastAPI](https://img.shields.io/badge/FastAPI-1EC9BD) [![Redis](https://img.shields.io/badge/Redis-%23DD0031.svg?logo=redis&logoColor=white)](#)  [![DuckDB](https://img.shields.io/badge/-DuckDB-FFF000?style=flat&logo=duckdb&logoColor=white)](#)
+<p align="center">
+  <img src="https://img.shields.io/badge/License-GPL%203.0-blue">
+  <br>
+  <img src="https://img.shields.io/badge/Vue.js-4FC08D">
+  <img src="https://img.shields.io/badge/GridStack.js-purple">
+  <img src="https://img.shields.io/badge/FastAPI-teal">
+  <img src="https://img.shields.io/badge/Redis-%23DD0031.svg?logo=redis&logoColor=white">
+  <img src="https://img.shields.io/badge/-DuckDB-FFF000?style=flat&logo=duckdb&logoColor=white">
+</p>
 
-</td></tr>
-</table>
+<br clear="left">
+<br>
 
 BuchiMaker is an API-first web application for building visual data dashboards. It reads your data (CSV, JSON, or partitioned Parquet) into an embedded [DuckDB](https://duckdb.org/) engine, lets you define dashboards as YAML — one flattened "base view" per dashboard, with SQL-defined totals, aggregates, and filters on top — and serves them through a REST API to a small static-HTML/Vue frontend.
 It is ideal for prototyping or hosting internal dashboards with big volume of data.
