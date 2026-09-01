@@ -1,7 +1,18 @@
 # BuchiMaker
 
-![Static Badge](https://img.shields.io/badge/License-GPL%203.0-blue)    
-  
+<table>
+  <tr>
+    <td width="40%" align="left">
+      <img src="./img/icon.png" alt="BuchiMaker logo" width="130">
+    </td>
+    <td width="60%" align="center">
+
+![License](https://img.shields.io/badge/License-GPL%203.0-blue)  
+![Vue 3](https://img.shields.io/badge/Vue.js-4FC08D?style=flat&logo=vue.js&logoColor=white) ![GridStack](https://img.shields.io/badge/GridStack.js-7D2FED) ![FastAPI](https://img.shields.io/badge/FastAPI-1EC9BD) [![Redis](https://img.shields.io/badge/Redis-%23DD0031.svg?logo=redis&logoColor=white)](#)  [![DuckDB](https://img.shields.io/badge/-DuckDB-FFF000?style=flat&logo=duckdb&logoColor=white)](#)
+
+</td></tr>
+</table>
+
 BuchiMaker is an API-first web application for building visual data dashboards. It reads your data (CSV, JSON, or partitioned Parquet) into an embedded [DuckDB](https://duckdb.org/) engine, lets you define dashboards as YAML — one flattened "base view" per dashboard, with SQL-defined totals, aggregates, and filters on top — and serves them through a REST API to a small static-HTML/Vue frontend.
 It is ideal for prototyping or hosting internal dashboards with big volume of data.
 
@@ -33,6 +44,7 @@ It is ideal for prototyping or hosting internal dashboards with big volume of da
 - **Frontend** — static HTML/Vue served by nginx (`frontend/`), no build step or Node toolchain required at runtime. It calls the backend over `API_BASE_URL`, injected at container start via `envsubst` (`frontend/entrypoint.sh`) — no rebuild needed to point it at a different backend.
 - **Widgets** — pluggable per-type Vue components loaded from a "widget set" folder (`frontend/widgets/default/` ships as the bundled default), so custom widget themes/sets can be dropped in without touching core frontend code.
 - **Dashboards as data, not code** — dashboards are YAML files loaded via API (`POST /api/v1/dashboards/load`), parsed and validated against the spec in `docs/dashboard_parser.md`, not hardcoded into the app. Dashboard YAML files are a mix of the markup (layout description) and SQLs for widgets.
+- **Vue and eCharts** - Frontend is developed using Vue, Gridstack.js, and eCharts. Widgets can be extended to support other [eCharts types](https://echarts.apache.org/examples/en/index.html).
 
 ## Technical Details
 - [Security considerations to deploy in production](./docs/security.md)
